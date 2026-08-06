@@ -54,6 +54,43 @@ type DiscordMessage = {
   thread?: { id: string };
 };
 
+export function channelPermissions(
+  guildId: string,
+  channel: DiscordChannel,
+  member: DiscordMember,
+  roles: Map<string, DiscordRole>,
+): bigint {
+  const roleIds = [guildId, ...member.roles];
+  let permissions = roleIds.reduce(
+    (value, roleId) => value | BigInt(roles.get(roleId)?.permissions ?? "0"),
+    0n,
+  );
+  if ((permissions & ADMINISTRATOR) !== 0n) {
+    return permissions;
+  }
+
+  const overwrites = channel.permission_overwrites ?? [];
+  const apply = (allow: bigint, deny: bigint) => {
+    permissions &= ~deny;
+    permissions |= allow;
+  };
+  const everyone = overwrites.find((overwrite) => overwrite.type === 0 && overwrite.id === guildId);
+  if (everyone) apply(BigInt(everyone.allow), BigInt(everyone.deny));
+
+  const roleOverwrites = overwrites.filter(
+    (overwrite) => overwrite.type === 0 && member.roles.includes(overwrite.id),
+  );
+  apply(
+    roleOverwrites.reduce((value, overwrite) => value | BigInt(overwrite.allow), 0n),
+    roleOverwrites.reduce((value, overwrite) => value | BigInt(overwrite.deny), 0n),
+  );
+
+  const memberOverwrite = overwrites.find((overwrite) => overwrite.type === 1 && overwrite.id === member.user.id);
+  if (memberOverwrite) apply(BigInt(memberOverwrite.allow), BigInt(memberOverwrite.deny));
+
+  return permissions;
+}
+
 function requiredEnv(name: string): string {
   const value = process.env[name]?.trim();
   if (!value) {
@@ -96,33 +133,6 @@ async function main(): Promise<void> {
     timeout: 15_000,
   });
 
-  const channelPermissions = (channel: DiscordChannel, member: DiscordMember, roles: Map<string, DiscordRole>): bigint => {
-    const roleIds = [guildId, ...member.roles];
-    let permissions = roleIds.reduce((value, roleId) => value | BigInt(roles.get(roleId)?.permissions ?? "0"), 0n);
-    if ((permissions & ADMINISTRATOR) !== 0n) {
-      return permissions;
-    }
-
-    const overwrites = channel.permission_overwrites ?? [];
-    const apply = (allow: bigint, deny: bigint) => {
-      permissions &= ~deny;
-      permissions |= allow;
-    };
-    const everyone = overwrites.find((overwrite) => overwrite.type === 0 && overwrite.id === guildId);
-    if (everyone) apply(BigInt(everyone.allow), BigInt(everyone.deny));
-
-    const roleOverwrites = overwrites.filter((overwrite) => overwrite.type === 0 && roleIds.includes(overwrite.id));
-    apply(
-      roleOverwrites.reduce((value, overwrite) => value | BigInt(overwrite.allow), 0n),
-      roleOverwrites.reduce((value, overwrite) => value | BigInt(overwrite.deny), 0n),
-    );
-
-    const memberOverwrite = overwrites.find((overwrite) => overwrite.type === 1 && overwrite.id === member.user.id);
-    if (memberOverwrite) apply(BigInt(memberOverwrite.allow), BigInt(memberOverwrite.deny));
-
-    return permissions;
-  };
-
   const accessibleChannels = async (): Promise<Map<string, DiscordChannel>> => {
     const [channelsResponse, rolesResponse, currentUserResponse] = await Promise.all([
       discord.get<DiscordChannel[]>(`/guilds/${guildId}/channels`),
@@ -136,7 +146,7 @@ async function main(): Promise<void> {
     return new Map(
       channelsResponse.data
         .filter((channel) => TEXT_CHANNEL_TYPES.has(channel.type))
-        .filter((channel) => (channelPermissions(channel, memberResponse.data, roles) & VIEW_CHANNEL) !== 0n)
+        .filter((channel) => (channelPermissions(guildId, channel, memberResponse.data, roles) & VIEW_CHANNEL) !== 0n)
         .map((channel) => [channel.id, channel]),
     );
   };
@@ -246,7 +256,9 @@ async function main(): Promise<void> {
   await server.connect(new StdioServerTransport());
 }
 
-main().catch((error) => {
-  console.error(errorText(error));
-  process.exit(1);
-});
+if (require.main === module) {
+  main().catch((error) => {
+    console.error(errorText(error));
+    process.exit(1);
+  });
+}

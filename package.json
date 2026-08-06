@@ -6,6 +6,7 @@
   "main": "lib/mcp.js",
   "scripts": {
     "build": "tsc -p .",
+    "test": "npm run build && node --test test/permissions.test.js",
     "mcp": "node lib/mcp.js"
   },
   "engines": {
