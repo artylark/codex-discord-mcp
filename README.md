@@ -3,7 +3,8 @@
 Local MCP server that gives Codex role-scoped access to a Discord bot.
 
 Discord roles are the source of truth. The MCP server computes the bot's
-current permissions and exposes only text channels the bot can view.
+current permissions and exposes only Guild Text and Announcement channels the
+bot can view. Forum, Media, and thread channels are excluded.
 
 ## Security boundaries
 
@@ -47,6 +48,8 @@ Restart Codex after editing its MCP configuration.
 
 ## Tools
 
-- `discord_list_channels` — list channels available through the bot's roles
-- `discord_read_messages` — read recent messages from an accessible channel
-- `discord_send_message` — send a message as the bot to an accessible channel
+- `discord_list_channels` — list accessible Guild Text and Announcement channels
+- `discord_read_messages` — read recent messages from an accessible Guild Text or Announcement channel
+- `discord_send_message` — send a message as the bot to an accessible Guild Text or Announcement channel
+
+Forum, Media, and thread channels are excluded from every tool.

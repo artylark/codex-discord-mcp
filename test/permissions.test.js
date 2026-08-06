@@ -1,7 +1,7 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 
-const { channelPermissions } = require("../lib/mcp.js");
+const { channelPermissions, isSupportedChannel, messageOutput } = require("../lib/mcp.js");
 
 const GUILD_ID = "100000000000000001";
 const ROLE_ID = "100000000000000002";
@@ -36,4 +36,43 @@ test("a member role allow overrides an @everyone deny", () => {
   ]);
 
   assert.equal(permissions & VIEW_CHANNEL, VIEW_CHANNEL);
+});
+
+test("only Guild Text and Announcement channels are supported", () => {
+  for (const type of [0, 5]) {
+    assert.equal(isSupportedChannel({ type }), true);
+  }
+
+  for (const type of [10, 11, 12, 15, 16]) {
+    assert.equal(isSupportedChannel({ type }), false);
+  }
+});
+
+test("message output omits thread identifiers", () => {
+  const output = messageOutput({
+    id: "100000000000000005",
+    content: "message content",
+    timestamp: "2026-08-06T00:00:00.000Z",
+    author: {
+      id: "100000000000000006",
+      username: "username",
+      global_name: "Display name",
+    },
+    attachments: [{ id: "100000000000000007", filename: "file.txt", url: "https://cdn.discordapp.com/file.txt" }],
+    thread: { id: "100000000000000008" },
+  });
+
+  assert.deepEqual(output, {
+    id: "100000000000000005",
+    content: "message content",
+    timestamp: "2026-08-06T00:00:00.000Z",
+    author: {
+      id: "100000000000000006",
+      name: "Display name",
+      username: "username",
+      bot: false,
+    },
+    attachments: [{ id: "100000000000000007", filename: "file.txt", url: "https://cdn.discordapp.com/file.txt" }],
+  });
+  assert.equal("thread_id" in output, false);
 });

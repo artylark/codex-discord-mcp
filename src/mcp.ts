@@ -7,7 +7,7 @@ const DISCORD_API_URL = "https://discord.com/api/v10";
 const DISCORD_SNOWFLAKE = /^\d{17,20}$/;
 const ADMINISTRATOR = 0x8n;
 const VIEW_CHANNEL = 0x400n;
-const TEXT_CHANNEL_TYPES = new Set([0, 5, 15, 16]);
+const SUPPORTED_CHANNEL_TYPES = new Set([0, 5]);
 
 type DiscordChannel = {
   id: string;
@@ -91,6 +91,25 @@ export function channelPermissions(
   return permissions;
 }
 
+export function isSupportedChannel(channel: Pick<DiscordChannel, "type">): boolean {
+  return SUPPORTED_CHANNEL_TYPES.has(channel.type);
+}
+
+export function messageOutput(message: DiscordMessage) {
+  return {
+    id: message.id,
+    content: message.content,
+    timestamp: message.timestamp,
+    author: {
+      id: message.author.id,
+      name: message.author.global_name ?? message.author.username,
+      username: message.author.username,
+      bot: message.author.bot ?? false,
+    },
+    attachments: message.attachments.map(({ id, filename, url }) => ({ id, filename, url })),
+  };
+}
+
 function requiredEnv(name: string): string {
   const value = process.env[name]?.trim();
   if (!value) {
@@ -145,7 +164,7 @@ async function main(): Promise<void> {
     const roles = new Map(rolesResponse.data.map((role) => [role.id, role]));
     return new Map(
       channelsResponse.data
-        .filter((channel) => TEXT_CHANNEL_TYPES.has(channel.type))
+        .filter(isSupportedChannel)
         .filter((channel) => (channelPermissions(guildId, channel, memberResponse.data, roles) & VIEW_CHANNEL) !== 0n)
         .map((channel) => [channel.id, channel]),
     );
@@ -155,7 +174,7 @@ async function main(): Promise<void> {
     const channels = await accessibleChannels();
     const channel = channels.get(channelId);
     if (!channel) {
-      throw new Error("This bot does not have permission to view this text channel.");
+      throw new Error("This bot does not have permission to view this supported channel.");
     }
     return channel;
   };
@@ -166,7 +185,7 @@ async function main(): Promise<void> {
     "discord_list_channels",
     {
       title: "List accessible Discord channels",
-      description: "Lists only the text channels this Discord bot can currently view through its roles.",
+      description: "Lists only Guild Text and Announcement channels this Discord bot can currently view through its roles. Forum, Media, and thread channels are excluded.",
       annotations: { readOnlyHint: true },
     },
     async () => {
@@ -188,7 +207,7 @@ async function main(): Promise<void> {
     "discord_read_messages",
     {
       title: "Read Discord messages",
-      description: "Reads recent messages from one Discord text channel the bot can currently view through its roles.",
+      description: "Reads recent messages from one Guild Text or Announcement channel the bot can currently view through its roles. Forum, Media, and thread channels are excluded.",
       inputSchema: {
         channel_id: z.string().regex(DISCORD_SNOWFLAKE, "Use a Discord channel ID."),
         limit: z.number().int().min(1).max(50).default(20),
@@ -202,19 +221,7 @@ async function main(): Promise<void> {
         const response = await discord.get<DiscordMessage[]>(`/channels/${channel_id}/messages`, {
           params: { limit, ...(before ? { before } : {}) },
         });
-        const messages = response.data.map((message) => ({
-          id: message.id,
-          content: message.content,
-          timestamp: message.timestamp,
-          author: {
-            id: message.author.id,
-            name: message.author.global_name ?? message.author.username,
-            username: message.author.username,
-            bot: message.author.bot ?? false,
-          },
-          attachments: message.attachments.map(({ id, filename, url }) => ({ id, filename, url })),
-          thread_id: message.thread?.id ?? null,
-        }));
+        const messages = response.data.map(messageOutput);
         return textResult({ channel_id, messages });
       } catch (error) {
         return textResult({ error: errorText(error) });
@@ -226,7 +233,7 @@ async function main(): Promise<void> {
     "discord_send_message",
     {
       title: "Send a Discord message",
-      description: "Sends a message as the configured Discord bot to one Discord text channel the bot can currently view. Mentions are never notified.",
+      description: "Sends a message as the configured Discord bot to one Guild Text or Announcement channel the bot can currently view. Forum, Media, and thread channels are excluded. Mentions are never notified.",
       inputSchema: {
         channel_id: z.string().regex(DISCORD_SNOWFLAKE, "Use a Discord channel ID."),
         message: z.string().trim().min(1).max(2_000),
