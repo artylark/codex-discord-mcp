@@ -1,4 +1,4 @@
-import axios from "axios";
+import axios, { type AxiosInstance, type AxiosRequestConfig, type AxiosResponse } from "axios";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
@@ -7,7 +7,13 @@ const DISCORD_API_URL = "https://discord.com/api/v10";
 const DISCORD_SNOWFLAKE = /^\d{17,20}$/;
 const ADMINISTRATOR = 0x8n;
 const VIEW_CHANNEL = 0x400n;
-const TEXT_CHANNEL_TYPES = new Set([0, 5, 15, 16]);
+const READ_MESSAGE_HISTORY = 0x10000n;
+const SEND_MESSAGES = 0x800n;
+const LIST_CHANNELS_PERMISSIONS = VIEW_CHANNEL;
+const READ_MESSAGES_PERMISSIONS = VIEW_CHANNEL | READ_MESSAGE_HISTORY;
+const SEND_MESSAGE_PERMISSIONS = VIEW_CHANNEL | SEND_MESSAGES;
+const SUPPORTED_CHANNEL_TYPES = new Set([0, 5]);
+const MAX_TIMER_DELAY = 2_147_483_647;
 
 type DiscordChannel = {
   id: string;
@@ -54,6 +60,70 @@ type DiscordMessage = {
   thread?: { id: string };
 };
 
+type DiscordClient = Pick<AxiosInstance, "get" | "post">;
+type Sleep = (milliseconds: number) => Promise<void>;
+
+export function channelPermissions(
+  guildId: string,
+  channel: DiscordChannel,
+  member: DiscordMember,
+  roles: Map<string, DiscordRole>,
+): bigint {
+  const roleIds = [guildId, ...member.roles];
+  let permissions = roleIds.reduce(
+    (value, roleId) => value | BigInt(roles.get(roleId)?.permissions ?? "0"),
+    0n,
+  );
+  if ((permissions & ADMINISTRATOR) !== 0n) {
+    return permissions;
+  }
+
+  const overwrites = channel.permission_overwrites ?? [];
+  const apply = (allow: bigint, deny: bigint) => {
+    permissions &= ~deny;
+    permissions |= allow;
+  };
+  const everyone = overwrites.find((overwrite) => overwrite.type === 0 && overwrite.id === guildId);
+  if (everyone) apply(BigInt(everyone.allow), BigInt(everyone.deny));
+
+  const roleOverwrites = overwrites.filter(
+    (overwrite) => overwrite.type === 0 && member.roles.includes(overwrite.id),
+  );
+  apply(
+    roleOverwrites.reduce((value, overwrite) => value | BigInt(overwrite.allow), 0n),
+    roleOverwrites.reduce((value, overwrite) => value | BigInt(overwrite.deny), 0n),
+  );
+
+  const memberOverwrite = overwrites.find((overwrite) => overwrite.type === 1 && overwrite.id === member.user.id);
+  if (memberOverwrite) apply(BigInt(memberOverwrite.allow), BigInt(memberOverwrite.deny));
+
+  return permissions;
+}
+
+export function hasRequiredPermissions(permissions: bigint, requiredPermissions: bigint): boolean {
+  return (permissions & ADMINISTRATOR) !== 0n
+    || (permissions & requiredPermissions) === requiredPermissions;
+}
+
+export function isSupportedChannel(channel: Pick<DiscordChannel, "type">): boolean {
+  return SUPPORTED_CHANNEL_TYPES.has(channel.type);
+}
+
+export function messageOutput(message: DiscordMessage) {
+  return {
+    id: message.id,
+    content: message.content,
+    timestamp: message.timestamp,
+    author: {
+      id: message.author.id,
+      name: message.author.global_name ?? message.author.username,
+      username: message.author.username,
+      bot: message.author.bot ?? false,
+    },
+    attachments: message.attachments.map(({ id, filename, url }) => ({ id, filename, url })),
+  };
+}
+
 function requiredEnv(name: string): string {
   const value = process.env[name]?.trim();
   if (!value) {
@@ -87,81 +157,112 @@ function textResult(value: unknown) {
   };
 }
 
-async function main(): Promise<void> {
-  const token = requiredEnv("DISCORD_BOT_TOKEN");
-  const guildId = configuredGuildId();
-  const discord = axios.create({
-    baseURL: DISCORD_API_URL,
-    headers: { Authorization: `Bot ${token}` },
-    timeout: 15_000,
-  });
+function errorResult(error: unknown) {
+  return {
+    ...textResult({ error: errorText(error) }),
+    isError: true,
+  };
+}
 
-  const channelPermissions = (channel: DiscordChannel, member: DiscordMember, roles: Map<string, DiscordRole>): bigint => {
-    const roleIds = [guildId, ...member.roles];
-    let permissions = roleIds.reduce((value, roleId) => value | BigInt(roles.get(roleId)?.permissions ?? "0"), 0n);
-    if ((permissions & ADMINISTRATOR) !== 0n) {
-      return permissions;
-    }
+function sleep(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
 
-    const overwrites = channel.permission_overwrites ?? [];
-    const apply = (allow: bigint, deny: bigint) => {
-      permissions &= ~deny;
-      permissions |= allow;
-    };
-    const everyone = overwrites.find((overwrite) => overwrite.type === 0 && overwrite.id === guildId);
-    if (everyone) apply(BigInt(everyone.allow), BigInt(everyone.deny));
+function retryDelayMilliseconds(error: unknown): number | undefined {
+  const response = (error as {
+    response?: { status?: unknown; data?: { retry_after?: unknown }; headers?: unknown };
+  }).response;
+  if (response?.status !== 429) return undefined;
 
-    const roleOverwrites = overwrites.filter((overwrite) => overwrite.type === 0 && roleIds.includes(overwrite.id));
-    apply(
-      roleOverwrites.reduce((value, overwrite) => value | BigInt(overwrite.allow), 0n),
-      roleOverwrites.reduce((value, overwrite) => value | BigInt(overwrite.deny), 0n),
-    );
-
-    const memberOverwrite = overwrites.find((overwrite) => overwrite.type === 1 && overwrite.id === member.user.id);
-    if (memberOverwrite) apply(BigInt(memberOverwrite.allow), BigInt(memberOverwrite.deny));
-
-    return permissions;
+  const toMilliseconds = (value: unknown): number | undefined => {
+    if (typeof value === "string" && value.trim() === "") return undefined;
+    const seconds = typeof value === "number" || typeof value === "string" ? Number(value) : NaN;
+    const milliseconds = Math.ceil(seconds * 1_000);
+    return Number.isFinite(milliseconds) && milliseconds >= 0 && milliseconds <= MAX_TIMER_DELAY
+      ? milliseconds
+      : undefined;
   };
 
-  const accessibleChannels = async (): Promise<Map<string, DiscordChannel>> => {
+  const bodyDelay = toMilliseconds(response.data?.retry_after);
+  if (bodyDelay !== undefined) return bodyDelay;
+
+  const headers = response.headers;
+  const headerDelay = headers && typeof headers === "object" && "get" in headers
+    && typeof headers.get === "function"
+    ? headers.get("retry-after")
+    : (headers as Record<string, unknown> | undefined)?.["retry-after"]
+      ?? (headers as Record<string, unknown> | undefined)?.["Retry-After"];
+  return toMilliseconds(headerDelay);
+}
+
+async function discordGet<T>(
+  discord: DiscordClient,
+  url: string,
+  config: AxiosRequestConfig | undefined,
+  delay: Sleep,
+): Promise<AxiosResponse<T>> {
+  try {
+    return await discord.get<T>(url, config);
+  } catch (error) {
+    const milliseconds = retryDelayMilliseconds(error);
+    if (milliseconds === undefined) throw error;
+    await delay(milliseconds);
+    return discord.get<T>(url, config);
+  }
+}
+
+export function registerDiscordTools(
+  server: Pick<McpServer, "registerTool">,
+  discord: DiscordClient,
+  guildId: string,
+  { delay = sleep }: { delay?: Sleep } = {},
+): void {
+  const accessibleChannels = async (requiredPermissions: bigint): Promise<Map<string, DiscordChannel>> => {
     const [channelsResponse, rolesResponse, currentUserResponse] = await Promise.all([
-      discord.get<DiscordChannel[]>(`/guilds/${guildId}/channels`),
-      discord.get<DiscordRole[]>(`/guilds/${guildId}/roles`),
-      discord.get<DiscordUser>("/users/@me"),
+      discordGet<DiscordChannel[]>(discord, `/guilds/${guildId}/channels`, undefined, delay),
+      discordGet<DiscordRole[]>(discord, `/guilds/${guildId}/roles`, undefined, delay),
+      discordGet<DiscordUser>(discord, "/users/@me", undefined, delay),
     ]);
-    const memberResponse = await discord.get<DiscordMember>(
+    const memberResponse = await discordGet<DiscordMember>(
+      discord,
       `/guilds/${guildId}/members/${currentUserResponse.data.id}`,
+      undefined,
+      delay,
     );
     const roles = new Map(rolesResponse.data.map((role) => [role.id, role]));
     return new Map(
       channelsResponse.data
-        .filter((channel) => TEXT_CHANNEL_TYPES.has(channel.type))
-        .filter((channel) => (channelPermissions(channel, memberResponse.data, roles) & VIEW_CHANNEL) !== 0n)
+        .filter(isSupportedChannel)
+        .filter((channel) => hasRequiredPermissions(
+          channelPermissions(guildId, channel, memberResponse.data, roles),
+          requiredPermissions,
+        ))
         .map((channel) => [channel.id, channel]),
     );
   };
 
-  const assertAccessibleChannel = async (channelId: string): Promise<DiscordChannel> => {
-    const channels = await accessibleChannels();
+  const assertAccessibleChannel = async (
+    channelId: string,
+    requiredPermissions: bigint,
+  ): Promise<DiscordChannel> => {
+    const channels = await accessibleChannels(requiredPermissions);
     const channel = channels.get(channelId);
     if (!channel) {
-      throw new Error("This bot does not have permission to view this text channel.");
+      throw new Error("This bot does not have the required permissions for this supported channel.");
     }
     return channel;
   };
-
-  const server = new McpServer({ name: "codex-discord", version: "0.1.0" });
 
   server.registerTool(
     "discord_list_channels",
     {
       title: "List accessible Discord channels",
-      description: "Lists only the text channels this Discord bot can currently view through its roles.",
+      description: "Lists only Guild Text and Announcement channels where this Discord bot has VIEW_CHANNEL. Forum, Media, and thread channels are excluded.",
       annotations: { readOnlyHint: true },
     },
     async () => {
       try {
-        const channels = [...(await accessibleChannels()).values()].map((channel) => ({
+        const channels = [...(await accessibleChannels(LIST_CHANNELS_PERMISSIONS)).values()].map((channel) => ({
           id: channel.id,
           name: channel.name ?? null,
           parent_id: channel.parent_id ?? null,
@@ -169,7 +270,7 @@ async function main(): Promise<void> {
         }));
         return textResult({ channels });
       } catch (error) {
-        return textResult({ error: errorText(error) });
+        return errorResult(error);
       }
     },
   );
@@ -178,7 +279,7 @@ async function main(): Promise<void> {
     "discord_read_messages",
     {
       title: "Read Discord messages",
-      description: "Reads recent messages from one Discord text channel the bot can currently view through its roles.",
+      description: "Reads recent messages from one Guild Text or Announcement channel where the bot has VIEW_CHANNEL and READ_MESSAGE_HISTORY. Forum, Media, and thread channels are excluded.",
       inputSchema: {
         channel_id: z.string().regex(DISCORD_SNOWFLAKE, "Use a Discord channel ID."),
         limit: z.number().int().min(1).max(50).default(20),
@@ -188,26 +289,17 @@ async function main(): Promise<void> {
     },
     async ({ channel_id, limit, before }) => {
       try {
-        await assertAccessibleChannel(channel_id);
-        const response = await discord.get<DiscordMessage[]>(`/channels/${channel_id}/messages`, {
-          params: { limit, ...(before ? { before } : {}) },
-        });
-        const messages = response.data.map((message) => ({
-          id: message.id,
-          content: message.content,
-          timestamp: message.timestamp,
-          author: {
-            id: message.author.id,
-            name: message.author.global_name ?? message.author.username,
-            username: message.author.username,
-            bot: message.author.bot ?? false,
-          },
-          attachments: message.attachments.map(({ id, filename, url }) => ({ id, filename, url })),
-          thread_id: message.thread?.id ?? null,
-        }));
+        await assertAccessibleChannel(channel_id, READ_MESSAGES_PERMISSIONS);
+        const response = await discordGet<DiscordMessage[]>(
+          discord,
+          `/channels/${channel_id}/messages`,
+          { params: { limit, ...(before ? { before } : {}) } },
+          delay,
+        );
+        const messages = response.data.map(messageOutput);
         return textResult({ channel_id, messages });
       } catch (error) {
-        return textResult({ error: errorText(error) });
+        return errorResult(error);
       }
     },
   );
@@ -216,7 +308,7 @@ async function main(): Promise<void> {
     "discord_send_message",
     {
       title: "Send a Discord message",
-      description: "Sends a message as the configured Discord bot to one Discord text channel the bot can currently view. Mentions are never notified.",
+      description: "Sends a message as the configured Discord bot to one Guild Text or Announcement channel where it has VIEW_CHANNEL and SEND_MESSAGES. Forum, Media, and thread channels are excluded. Mentions are never notified.",
       inputSchema: {
         channel_id: z.string().regex(DISCORD_SNOWFLAKE, "Use a Discord channel ID."),
         message: z.string().trim().min(1).max(2_000),
@@ -225,7 +317,7 @@ async function main(): Promise<void> {
     },
     async ({ channel_id, message }) => {
       try {
-        await assertAccessibleChannel(channel_id);
+        await assertAccessibleChannel(channel_id, SEND_MESSAGE_PERMISSIONS);
         const response = await discord.post<DiscordMessage>(`/channels/${channel_id}/messages`, {
           content: message,
           allowed_mentions: { parse: [] },
@@ -238,15 +330,29 @@ async function main(): Promise<void> {
           author: sent.author.global_name ?? sent.author.username,
         });
       } catch (error) {
-        return textResult({ error: errorText(error) });
+        return errorResult(error);
       }
     },
   );
+}
 
+async function main(): Promise<void> {
+  const token = requiredEnv("DISCORD_BOT_TOKEN");
+  const guildId = configuredGuildId();
+  const discord = axios.create({
+    baseURL: DISCORD_API_URL,
+    headers: { Authorization: `Bot ${token}` },
+    timeout: 15_000,
+  });
+  const server = new McpServer({ name: "codex-discord", version: "0.1.0" });
+
+  registerDiscordTools(server, discord, guildId);
   await server.connect(new StdioServerTransport());
 }
 
-main().catch((error) => {
-  console.error(errorText(error));
-  process.exit(1);
-});
+if (require.main === module) {
+  main().catch((error) => {
+    console.error(errorText(error));
+    process.exit(1);
+  });
+}

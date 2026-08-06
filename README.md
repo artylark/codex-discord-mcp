@@ -1,9 +1,11 @@
 # codex-discord-mcp
 
-Local MCP server that gives Codex role-scoped access to a Discord bot.
+Local MCP server that gives Codex Discord-permission-scoped access to a bot.
 
-Discord roles are the source of truth. The MCP server computes the bot's
-current permissions and exposes only text channels the bot can view.
+Discord guild roles and channel permission overwrites are the source of truth.
+The MCP server computes the bot's current permissions and exposes only Guild
+Text and Announcement channels the bot is allowed to use for each tool. Forum,
+Media, and thread channels are excluded.
 
 ## Security boundaries
 
@@ -12,6 +14,16 @@ current permissions and exposes only text channels the bot can view.
 - It does not expose role, channel, message-editing, message-deletion, or
   server-management tools.
 - Outgoing messages disable all user and role notifications.
+
+## Required Discord permissions
+
+- `discord_list_channels` requires `VIEW_CHANNEL`.
+- `discord_read_messages` requires both `VIEW_CHANNEL` and
+  `READ_MESSAGE_HISTORY`.
+- `discord_send_message` requires both `VIEW_CHANNEL` and `SEND_MESSAGES`.
+
+The `ADMINISTRATOR` permission satisfies these checks, but it is not
+recommended for this bot.
 
 ## Setup
 
@@ -24,15 +36,18 @@ current permissions and exposes only text channels the bot can view.
    security add-generic-password -a "$USER" -s codex-discord-bot-token -U -w
    ```
 
-3. Enable Discord Developer Mode and copy the server ID.
-4. Install dependencies and build:
+3. In the Discord Developer Portal, enable the Message Content privileged intent
+   for the bot. Verified apps require Discord's approval for this intent. Without
+   it, `discord_read_messages` receives empty message content and attachments.
+4. Enable Discord Developer Mode and copy the server ID.
+5. Install dependencies and build:
 
    ```sh
    npm install
    npm run build
    ```
 
-5. Add the server to `~/.codex/config.toml`:
+6. Add the server to `~/.codex/config.toml`:
 
    ```toml
    [mcp_servers.discord]
@@ -47,6 +62,8 @@ Restart Codex after editing its MCP configuration.
 
 ## Tools
 
-- `discord_list_channels` — list channels available through the bot's roles
-- `discord_read_messages` — read recent messages from an accessible channel
-- `discord_send_message` — send a message as the bot to an accessible channel
+- `discord_list_channels` — list Guild Text and Announcement channels where the bot has `VIEW_CHANNEL`
+- `discord_read_messages` — read recent messages where the bot has both `VIEW_CHANNEL` and `READ_MESSAGE_HISTORY`
+- `discord_send_message` — send a message where the bot has both `VIEW_CHANNEL` and `SEND_MESSAGES`
+
+Forum, Media, and thread channels are excluded from every tool.
