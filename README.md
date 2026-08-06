@@ -1,11 +1,11 @@
 # codex-discord-mcp
 
-Local MCP server that gives Codex role-scoped access to a Discord bot.
+Local MCP server that gives Codex Discord-permission-scoped access to a bot.
 
-Discord roles are the source of truth. The MCP server computes the bot's
-current permissions and exposes only Guild Text and Announcement channels the
-bot is allowed to use for each tool. Forum, Media, and thread channels are
-excluded.
+Discord guild roles and channel permission overwrites are the source of truth.
+The MCP server computes the bot's current permissions and exposes only Guild
+Text and Announcement channels the bot is allowed to use for each tool. Forum,
+Media, and thread channels are excluded.
 
 ## Security boundaries
 

@@ -2,11 +2,11 @@
   "name": "codex-discord-mcp",
   "version": "0.1.0",
   "private": true,
-  "description": "Local, role-scoped Discord MCP server for Codex",
+  "description": "Local, permission-scoped Discord MCP server for Codex",
   "main": "lib/mcp.js",
   "scripts": {
     "build": "tsc -p .",
-    "test": "npm run build && node --test test/permissions.test.js",
+    "test": "npm run build && node --test test/*.test.js",
     "mcp": "node lib/mcp.js"
   },
   "engines": {
