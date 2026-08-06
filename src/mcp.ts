@@ -1,4 +1,4 @@
-import axios from "axios";
+import axios, { type AxiosInstance } from "axios";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
@@ -7,6 +7,11 @@ const DISCORD_API_URL = "https://discord.com/api/v10";
 const DISCORD_SNOWFLAKE = /^\d{17,20}$/;
 const ADMINISTRATOR = 0x8n;
 const VIEW_CHANNEL = 0x400n;
+const READ_MESSAGE_HISTORY = 0x10000n;
+const SEND_MESSAGES = 0x800n;
+const LIST_CHANNELS_PERMISSIONS = VIEW_CHANNEL;
+const READ_MESSAGES_PERMISSIONS = VIEW_CHANNEL | READ_MESSAGE_HISTORY;
+const SEND_MESSAGE_PERMISSIONS = VIEW_CHANNEL | SEND_MESSAGES;
 const SUPPORTED_CHANNEL_TYPES = new Set([0, 5]);
 
 type DiscordChannel = {
@@ -91,6 +96,11 @@ export function channelPermissions(
   return permissions;
 }
 
+export function hasRequiredPermissions(permissions: bigint, requiredPermissions: bigint): boolean {
+  return (permissions & ADMINISTRATOR) !== 0n
+    || (permissions & requiredPermissions) === requiredPermissions;
+}
+
 export function isSupportedChannel(channel: Pick<DiscordChannel, "type">): boolean {
   return SUPPORTED_CHANNEL_TYPES.has(channel.type);
 }
@@ -143,16 +153,12 @@ function textResult(value: unknown) {
   };
 }
 
-async function main(): Promise<void> {
-  const token = requiredEnv("DISCORD_BOT_TOKEN");
-  const guildId = configuredGuildId();
-  const discord = axios.create({
-    baseURL: DISCORD_API_URL,
-    headers: { Authorization: `Bot ${token}` },
-    timeout: 15_000,
-  });
-
-  const accessibleChannels = async (): Promise<Map<string, DiscordChannel>> => {
+export function registerDiscordTools(
+  server: Pick<McpServer, "registerTool">,
+  discord: AxiosInstance,
+  guildId: string,
+): void {
+  const accessibleChannels = async (requiredPermissions: bigint): Promise<Map<string, DiscordChannel>> => {
     const [channelsResponse, rolesResponse, currentUserResponse] = await Promise.all([
       discord.get<DiscordChannel[]>(`/guilds/${guildId}/channels`),
       discord.get<DiscordRole[]>(`/guilds/${guildId}/roles`),
@@ -165,32 +171,36 @@ async function main(): Promise<void> {
     return new Map(
       channelsResponse.data
         .filter(isSupportedChannel)
-        .filter((channel) => (channelPermissions(guildId, channel, memberResponse.data, roles) & VIEW_CHANNEL) !== 0n)
+        .filter((channel) => hasRequiredPermissions(
+          channelPermissions(guildId, channel, memberResponse.data, roles),
+          requiredPermissions,
+        ))
         .map((channel) => [channel.id, channel]),
     );
   };
 
-  const assertAccessibleChannel = async (channelId: string): Promise<DiscordChannel> => {
-    const channels = await accessibleChannels();
+  const assertAccessibleChannel = async (
+    channelId: string,
+    requiredPermissions: bigint,
+  ): Promise<DiscordChannel> => {
+    const channels = await accessibleChannels(requiredPermissions);
     const channel = channels.get(channelId);
     if (!channel) {
-      throw new Error("This bot does not have permission to view this supported channel.");
+      throw new Error("This bot does not have the required permissions for this supported channel.");
     }
     return channel;
   };
-
-  const server = new McpServer({ name: "codex-discord", version: "0.1.0" });
 
   server.registerTool(
     "discord_list_channels",
     {
       title: "List accessible Discord channels",
-      description: "Lists only Guild Text and Announcement channels this Discord bot can currently view through its roles. Forum, Media, and thread channels are excluded.",
+      description: "Lists only Guild Text and Announcement channels where this Discord bot has VIEW_CHANNEL. Forum, Media, and thread channels are excluded.",
       annotations: { readOnlyHint: true },
     },
     async () => {
       try {
-        const channels = [...(await accessibleChannels()).values()].map((channel) => ({
+        const channels = [...(await accessibleChannels(LIST_CHANNELS_PERMISSIONS)).values()].map((channel) => ({
           id: channel.id,
           name: channel.name ?? null,
           parent_id: channel.parent_id ?? null,
@@ -207,7 +217,7 @@ async function main(): Promise<void> {
     "discord_read_messages",
     {
       title: "Read Discord messages",
-      description: "Reads recent messages from one Guild Text or Announcement channel the bot can currently view through its roles. Forum, Media, and thread channels are excluded.",
+      description: "Reads recent messages from one Guild Text or Announcement channel where the bot has VIEW_CHANNEL and READ_MESSAGE_HISTORY. Forum, Media, and thread channels are excluded.",
       inputSchema: {
         channel_id: z.string().regex(DISCORD_SNOWFLAKE, "Use a Discord channel ID."),
         limit: z.number().int().min(1).max(50).default(20),
@@ -217,7 +227,7 @@ async function main(): Promise<void> {
     },
     async ({ channel_id, limit, before }) => {
       try {
-        await assertAccessibleChannel(channel_id);
+        await assertAccessibleChannel(channel_id, READ_MESSAGES_PERMISSIONS);
         const response = await discord.get<DiscordMessage[]>(`/channels/${channel_id}/messages`, {
           params: { limit, ...(before ? { before } : {}) },
         });
@@ -233,7 +243,7 @@ async function main(): Promise<void> {
     "discord_send_message",
     {
       title: "Send a Discord message",
-      description: "Sends a message as the configured Discord bot to one Guild Text or Announcement channel the bot can currently view. Forum, Media, and thread channels are excluded. Mentions are never notified.",
+      description: "Sends a message as the configured Discord bot to one Guild Text or Announcement channel where it has VIEW_CHANNEL and SEND_MESSAGES. Forum, Media, and thread channels are excluded. Mentions are never notified.",
       inputSchema: {
         channel_id: z.string().regex(DISCORD_SNOWFLAKE, "Use a Discord channel ID."),
         message: z.string().trim().min(1).max(2_000),
@@ -242,7 +252,7 @@ async function main(): Promise<void> {
     },
     async ({ channel_id, message }) => {
       try {
-        await assertAccessibleChannel(channel_id);
+        await assertAccessibleChannel(channel_id, SEND_MESSAGE_PERMISSIONS);
         const response = await discord.post<DiscordMessage>(`/channels/${channel_id}/messages`, {
           content: message,
           allowed_mentions: { parse: [] },
@@ -259,7 +269,19 @@ async function main(): Promise<void> {
       }
     },
   );
+}
 
+async function main(): Promise<void> {
+  const token = requiredEnv("DISCORD_BOT_TOKEN");
+  const guildId = configuredGuildId();
+  const discord = axios.create({
+    baseURL: DISCORD_API_URL,
+    headers: { Authorization: `Bot ${token}` },
+    timeout: 15_000,
+  });
+  const server = new McpServer({ name: "codex-discord", version: "0.1.0" });
+
+  registerDiscordTools(server, discord, guildId);
   await server.connect(new StdioServerTransport());
 }
 
