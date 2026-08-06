@@ -36,15 +36,18 @@ recommended for this bot.
    security add-generic-password -a "$USER" -s codex-discord-bot-token -U -w
    ```
 
-3. Enable Discord Developer Mode and copy the server ID.
-4. Install dependencies and build:
+3. In the Discord Developer Portal, enable the Message Content privileged intent
+   for the bot. Verified apps require Discord's approval for this intent. Without
+   it, `discord_read_messages` receives empty message content and attachments.
+4. Enable Discord Developer Mode and copy the server ID.
+5. Install dependencies and build:
 
    ```sh
    npm install
    npm run build
    ```
 
-5. Add the server to `~/.codex/config.toml`:
+6. Add the server to `~/.codex/config.toml`:
 
    ```toml
    [mcp_servers.discord]
