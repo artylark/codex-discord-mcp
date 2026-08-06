@@ -1,4 +1,4 @@
-import axios, { type AxiosInstance } from "axios";
+import axios, { type AxiosInstance, type AxiosRequestConfig, type AxiosResponse } from "axios";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
@@ -13,6 +13,7 @@ const LIST_CHANNELS_PERMISSIONS = VIEW_CHANNEL;
 const READ_MESSAGES_PERMISSIONS = VIEW_CHANNEL | READ_MESSAGE_HISTORY;
 const SEND_MESSAGE_PERMISSIONS = VIEW_CHANNEL | SEND_MESSAGES;
 const SUPPORTED_CHANNEL_TYPES = new Set([0, 5]);
+const MAX_TIMER_DELAY = 2_147_483_647;
 
 type DiscordChannel = {
   id: string;
@@ -58,6 +59,9 @@ type DiscordMessage = {
   }>;
   thread?: { id: string };
 };
+
+type DiscordClient = Pick<AxiosInstance, "get" | "post">;
+type Sleep = (milliseconds: number) => Promise<void>;
 
 export function channelPermissions(
   guildId: string,
@@ -160,19 +164,70 @@ function errorResult(error: unknown) {
   };
 }
 
+function sleep(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+function retryDelayMilliseconds(error: unknown): number | undefined {
+  const response = (error as {
+    response?: { status?: unknown; data?: { retry_after?: unknown }; headers?: unknown };
+  }).response;
+  if (response?.status !== 429) return undefined;
+
+  const toMilliseconds = (value: unknown): number | undefined => {
+    if (typeof value === "string" && value.trim() === "") return undefined;
+    const seconds = typeof value === "number" || typeof value === "string" ? Number(value) : NaN;
+    const milliseconds = Math.ceil(seconds * 1_000);
+    return Number.isFinite(milliseconds) && milliseconds >= 0 && milliseconds <= MAX_TIMER_DELAY
+      ? milliseconds
+      : undefined;
+  };
+
+  const bodyDelay = toMilliseconds(response.data?.retry_after);
+  if (bodyDelay !== undefined) return bodyDelay;
+
+  const headers = response.headers;
+  const headerDelay = headers && typeof headers === "object" && "get" in headers
+    && typeof headers.get === "function"
+    ? headers.get("retry-after")
+    : (headers as Record<string, unknown> | undefined)?.["retry-after"]
+      ?? (headers as Record<string, unknown> | undefined)?.["Retry-After"];
+  return toMilliseconds(headerDelay);
+}
+
+async function discordGet<T>(
+  discord: DiscordClient,
+  url: string,
+  config: AxiosRequestConfig | undefined,
+  delay: Sleep,
+): Promise<AxiosResponse<T>> {
+  try {
+    return await discord.get<T>(url, config);
+  } catch (error) {
+    const milliseconds = retryDelayMilliseconds(error);
+    if (milliseconds === undefined) throw error;
+    await delay(milliseconds);
+    return discord.get<T>(url, config);
+  }
+}
+
 export function registerDiscordTools(
   server: Pick<McpServer, "registerTool">,
-  discord: AxiosInstance,
+  discord: DiscordClient,
   guildId: string,
+  { delay = sleep }: { delay?: Sleep } = {},
 ): void {
   const accessibleChannels = async (requiredPermissions: bigint): Promise<Map<string, DiscordChannel>> => {
     const [channelsResponse, rolesResponse, currentUserResponse] = await Promise.all([
-      discord.get<DiscordChannel[]>(`/guilds/${guildId}/channels`),
-      discord.get<DiscordRole[]>(`/guilds/${guildId}/roles`),
-      discord.get<DiscordUser>("/users/@me"),
+      discordGet<DiscordChannel[]>(discord, `/guilds/${guildId}/channels`, undefined, delay),
+      discordGet<DiscordRole[]>(discord, `/guilds/${guildId}/roles`, undefined, delay),
+      discordGet<DiscordUser>(discord, "/users/@me", undefined, delay),
     ]);
-    const memberResponse = await discord.get<DiscordMember>(
+    const memberResponse = await discordGet<DiscordMember>(
+      discord,
       `/guilds/${guildId}/members/${currentUserResponse.data.id}`,
+      undefined,
+      delay,
     );
     const roles = new Map(rolesResponse.data.map((role) => [role.id, role]));
     return new Map(
@@ -235,9 +290,12 @@ export function registerDiscordTools(
     async ({ channel_id, limit, before }) => {
       try {
         await assertAccessibleChannel(channel_id, READ_MESSAGES_PERMISSIONS);
-        const response = await discord.get<DiscordMessage[]>(`/channels/${channel_id}/messages`, {
-          params: { limit, ...(before ? { before } : {}) },
-        });
+        const response = await discordGet<DiscordMessage[]>(
+          discord,
+          `/channels/${channel_id}/messages`,
+          { params: { limit, ...(before ? { before } : {}) } },
+          delay,
+        );
         const messages = response.data.map(messageOutput);
         return textResult({ channel_id, messages });
       } catch (error) {

@@ -18,12 +18,21 @@ const READ_MESSAGE_HISTORY = 0x10000n;
 const SEND_MESSAGES = 0x800n;
 const CHANNEL_ID = "100000000000000004";
 
-function registeredTools(permissions, { failChannelListing = false } = {}) {
+function registeredTools(permissions, {
+  failChannelListing = false,
+  getHandler,
+  postHandler,
+  delay,
+} = {}) {
   const tools = new Map();
   const calls = [];
   const discord = {
     get: async (url, config) => {
       calls.push({ method: "get", url, config });
+      if (getHandler) {
+        const result = await getHandler(url, config, calls);
+        if (result !== undefined) return result;
+      }
       if (url === `/guilds/${GUILD_ID}/channels`) {
         if (failChannelListing) {
           throw new Error("Unable to list channels");
@@ -34,7 +43,10 @@ function registeredTools(permissions, { failChannelListing = false } = {}) {
         return {
           data: [
             { id: GUILD_ID, permissions: "0" },
-            { id: ROLE_ID, permissions: permissions.toString() },
+            {
+              id: ROLE_ID,
+              permissions: (typeof permissions === "function" ? permissions() : permissions).toString(),
+            },
           ],
         };
       }
@@ -44,10 +56,14 @@ function registeredTools(permissions, { failChannelListing = false } = {}) {
       if (url === `/guilds/${GUILD_ID}/members/${MEMBER_ID}`) {
         return { data: { roles: [ROLE_ID], user: { id: MEMBER_ID } } };
       }
+      if (url === `/channels/${CHANNEL_ID}/messages`) {
+        return { data: [] };
+      }
       throw new Error(`Unexpected GET ${url}`);
     },
     post: async (url, data) => {
       calls.push({ method: "post", url, data });
+      if (postHandler) return postHandler(url, data, calls);
       throw new Error(`Unexpected POST ${url}`);
     },
   };
@@ -57,7 +73,7 @@ function registeredTools(permissions, { failChannelListing = false } = {}) {
     },
   };
 
-  registerDiscordTools(server, discord, GUILD_ID);
+  registerDiscordTools(server, discord, GUILD_ID, { delay });
   return { calls, tools };
 }
 
@@ -67,6 +83,17 @@ function resultJson(result) {
 
 function assertNoMessagesRequest(calls) {
   assert.equal(calls.some(({ url }) => url === `/channels/${CHANNEL_ID}/messages`), false);
+}
+
+function rateLimitError({ retryAfter, headers } = {}) {
+  const error = new Error("You are being rate limited.");
+  error.isAxiosError = true;
+  error.response = {
+    status: 429,
+    data: retryAfter === undefined ? {} : { retry_after: retryAfter },
+    headers,
+  };
+  return error;
 }
 
 function permissionsFor(overwrites) {
@@ -144,6 +171,149 @@ test("list handler marks Discord failures as errors", async () => {
 
   assert.match(resultJson(result).error, /Unable to list channels/);
   assert.equal(result.isError, true);
+});
+
+test("preflight GET requests retry once after Discord's retry_after delay", async () => {
+  const attempts = new Set();
+  const delays = [];
+  const preflightUrls = new Set([
+    `/guilds/${GUILD_ID}/channels`,
+    `/guilds/${GUILD_ID}/roles`,
+    "/users/@me",
+    `/guilds/${GUILD_ID}/members/${MEMBER_ID}`,
+  ]);
+  const { calls, tools } = registeredTools(VIEW_CHANNEL, {
+    getHandler: async (url) => {
+      if (preflightUrls.has(url) && !attempts.has(url)) {
+        attempts.add(url);
+        throw rateLimitError({ retryAfter: 0.25 });
+      }
+    },
+    delay: async (milliseconds) => { delays.push(milliseconds); },
+  });
+
+  const result = await tools.get("discord_list_channels").handler({});
+
+  assert.deepEqual(resultJson(result).channels.map(({ id }) => id), [CHANNEL_ID]);
+  assert.deepEqual(delays, [250, 250, 250, 250]);
+  for (const url of preflightUrls) {
+    assert.equal(calls.filter((call) => call.url === url).length, 2);
+  }
+});
+
+test("rate-limit retry uses Retry-After when the body is malformed and preserves an unparseable 429", async () => {
+  let channelRequests = 0;
+  const delays = [];
+  const { calls, tools } = registeredTools(VIEW_CHANNEL, {
+    getHandler: async (url) => {
+      if (url !== `/guilds/${GUILD_ID}/channels`) return undefined;
+      channelRequests += 1;
+      if (channelRequests === 1) {
+        throw rateLimitError({ retryAfter: "invalid", headers: { "retry-after": "0.5" } });
+      }
+      if (channelRequests === 2) return undefined;
+      throw rateLimitError({ retryAfter: " ", headers: { "retry-after": "invalid" } });
+    },
+    delay: async (milliseconds) => { delays.push(milliseconds); },
+  });
+
+  const first = await tools.get("discord_list_channels").handler({});
+  const second = await tools.get("discord_list_channels").handler({});
+
+  assert.deepEqual(resultJson(first).channels.map(({ id }) => id), [CHANNEL_ID]);
+  assert.equal(second.isError, true);
+  assert.deepEqual(delays, [500]);
+  assert.equal(calls.filter((call) => call.url === `/guilds/${GUILD_ID}/channels`).length, 3);
+});
+
+test("rate-limit retry preserves a 429 whose delay exceeds Node's timer range", async () => {
+  const delays = [];
+  const { calls, tools } = registeredTools(VIEW_CHANNEL, {
+    getHandler: async (url) => {
+      if (url === `/guilds/${GUILD_ID}/channels`) {
+        throw rateLimitError({ retryAfter: 2_147_483.648 });
+      }
+    },
+    delay: async (milliseconds) => { delays.push(milliseconds); },
+  });
+
+  const result = await tools.get("discord_list_channels").handler({});
+
+  assert.equal(result.isError, true);
+  assert.deepEqual(delays, []);
+  assert.equal(calls.filter((call) => call.url === `/guilds/${GUILD_ID}/channels`).length, 1);
+});
+
+test("message GET retries once and returns an error after a second 429", async () => {
+  let attempts = 0;
+  const delays = [];
+  const { calls, tools } = registeredTools(VIEW_CHANNEL | READ_MESSAGE_HISTORY, {
+    getHandler: async (url) => {
+      if (url !== `/channels/${CHANNEL_ID}/messages`) return undefined;
+      attempts += 1;
+      if (attempts === 1 || attempts >= 3) throw rateLimitError({ retryAfter: 0 });
+      return undefined;
+    },
+    delay: async (milliseconds) => { delays.push(milliseconds); },
+  });
+
+  const first = await tools.get("discord_read_messages").handler({ channel_id: CHANNEL_ID, limit: 20 });
+  const second = await tools.get("discord_read_messages").handler({ channel_id: CHANNEL_ID, limit: 20 });
+
+  assert.deepEqual(resultJson(first).messages, []);
+  assert.equal(second.isError, true);
+  assert.equal(calls.filter((call) => call.url === `/channels/${CHANNEL_ID}/messages`).length, 4);
+  assert.deepEqual(delays, [0, 0]);
+});
+
+test("concurrent calls authorize against separate preflight snapshots", async () => {
+  let releaseChannels;
+  const channelsStarted = new Promise((resolve) => { releaseChannels = resolve; });
+  const { calls, tools } = registeredTools(VIEW_CHANNEL, {
+    getHandler: async (url) => {
+      if (url === `/guilds/${GUILD_ID}/channels`) await channelsStarted;
+    },
+  });
+
+  const list = tools.get("discord_list_channels").handler({});
+  const send = tools.get("discord_send_message").handler({ channel_id: CHANNEL_ID, message: "Hello" });
+  releaseChannels();
+  const [listResult, sendResult] = await Promise.all([list, send]);
+
+  assert.deepEqual(resultJson(listResult).channels.map(({ id }) => id), [CHANNEL_ID]);
+  assert.equal(sendResult.isError, true);
+  assert.equal(calls.filter((call) => call.method === "get").length, 8);
+  assert.equal(calls.filter((call) => call.method === "post").length, 0);
+});
+
+test("a settled preflight snapshot is not cached across calls", async () => {
+  let currentPermissions = VIEW_CHANNEL;
+  const { calls, tools } = registeredTools(() => currentPermissions);
+
+  const first = await tools.get("discord_list_channels").handler({});
+  currentPermissions = 0n;
+  const second = await tools.get("discord_list_channels").handler({});
+
+  assert.deepEqual(resultJson(first).channels.map(({ id }) => id), [CHANNEL_ID]);
+  assert.deepEqual(resultJson(second).channels, []);
+  assert.equal(calls.filter((call) => call.method === "get").length, 8);
+});
+
+test("send does not retry a rate-limited POST", async () => {
+  const delays = [];
+  const { calls, tools } = registeredTools(VIEW_CHANNEL | SEND_MESSAGES, {
+    postHandler: async () => { throw rateLimitError({ retryAfter: 0 }); },
+    delay: async (milliseconds) => { delays.push(milliseconds); },
+  });
+
+  const result = await tools.get("discord_send_message").handler({
+    channel_id: CHANNEL_ID,
+    message: "Hello, Discord!",
+  });
+
+  assert.equal(result.isError, true);
+  assert.equal(calls.filter((call) => call.method === "post").length, 1);
+  assert.deepEqual(delays, []);
 });
 
 test("only Guild Text and Announcement channels are supported", () => {
