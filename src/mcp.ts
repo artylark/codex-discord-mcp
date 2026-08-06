@@ -153,6 +153,13 @@ function textResult(value: unknown) {
   };
 }
 
+function errorResult(error: unknown) {
+  return {
+    ...textResult({ error: errorText(error) }),
+    isError: true,
+  };
+}
+
 export function registerDiscordTools(
   server: Pick<McpServer, "registerTool">,
   discord: AxiosInstance,
@@ -208,7 +215,7 @@ export function registerDiscordTools(
         }));
         return textResult({ channels });
       } catch (error) {
-        return textResult({ error: errorText(error) });
+        return errorResult(error);
       }
     },
   );
@@ -234,7 +241,7 @@ export function registerDiscordTools(
         const messages = response.data.map(messageOutput);
         return textResult({ channel_id, messages });
       } catch (error) {
-        return textResult({ error: errorText(error) });
+        return errorResult(error);
       }
     },
   );
@@ -265,7 +272,7 @@ export function registerDiscordTools(
           author: sent.author.global_name ?? sent.author.username,
         });
       } catch (error) {
-        return textResult({ error: errorText(error) });
+        return errorResult(error);
       }
     },
   );

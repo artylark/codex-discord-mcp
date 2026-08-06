@@ -18,13 +18,16 @@ const READ_MESSAGE_HISTORY = 0x10000n;
 const SEND_MESSAGES = 0x800n;
 const CHANNEL_ID = "100000000000000004";
 
-function registeredTools(permissions) {
+function registeredTools(permissions, { failChannelListing = false } = {}) {
   const tools = new Map();
   const calls = [];
   const discord = {
     get: async (url, config) => {
       calls.push({ method: "get", url, config });
       if (url === `/guilds/${GUILD_ID}/channels`) {
+        if (failChannelListing) {
+          throw new Error("Unable to list channels");
+        }
         return { data: [{ id: CHANNEL_ID, type: 0 }] };
       }
       if (url === `/guilds/${GUILD_ID}/roles`) {
@@ -117,6 +120,7 @@ test("read handler denies a channel without READ_MESSAGE_HISTORY before requesti
   });
 
   assert.match(resultJson(result).error, /required permissions/);
+  assert.equal(result.isError, true);
   assertNoMessagesRequest(calls);
 });
 
@@ -129,7 +133,17 @@ test("send handler denies a channel without SEND_MESSAGES before posting a messa
   });
 
   assert.match(resultJson(result).error, /required permissions/);
+  assert.equal(result.isError, true);
   assertNoMessagesRequest(calls);
+});
+
+test("list handler marks Discord failures as errors", async () => {
+  const { tools } = registeredTools(VIEW_CHANNEL, { failChannelListing: true });
+
+  const result = await tools.get("discord_list_channels").handler({});
+
+  assert.match(resultJson(result).error, /Unable to list channels/);
+  assert.equal(result.isError, true);
 });
 
 test("only Guild Text and Announcement channels are supported", () => {
