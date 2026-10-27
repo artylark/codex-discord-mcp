@@ -17,9 +17,12 @@ const VIEW_CHANNEL = 0x400n;
 const READ_MESSAGE_HISTORY = 0x10000n;
 const SEND_MESSAGES = 0x800n;
 const CHANNEL_ID = "100000000000000004";
+const THREAD_ID = "100000000000000005";
+const OTHER_CHANNEL_ID = "100000000000000006";
 
 function registeredTools(permissions, {
   failChannelListing = false,
+  channels = [{ id: CHANNEL_ID, type: 0 }],
   getHandler,
   postHandler,
   delay,
@@ -37,7 +40,7 @@ function registeredTools(permissions, {
         if (failChannelListing) {
           throw new Error("Unable to list channels");
         }
-        return { data: [{ id: CHANNEL_ID, type: 0 }] };
+        return { data: channels };
       }
       if (url === `/guilds/${GUILD_ID}/roles`) {
         return {
@@ -82,7 +85,7 @@ function resultJson(result) {
 }
 
 function assertNoMessagesRequest(calls) {
-  assert.equal(calls.some(({ url }) => url === `/channels/${CHANNEL_ID}/messages`), false);
+  assert.equal(calls.some(({ url }) => /\/channels\/\d+\/messages$/.test(url)), false);
 }
 
 function rateLimitError({ retryAfter, headers } = {}) {
@@ -96,6 +99,13 @@ function rateLimitError({ retryAfter, headers } = {}) {
   return error;
 }
 
+function discordApiError(status, message) {
+  const error = new Error(message);
+  error.isAxiosError = true;
+  error.response = { status, data: { message } };
+  return error;
+}
+
 function permissionsFor(overwrites) {
   return channelPermissions(
     GUILD_ID,
@@ -106,6 +116,27 @@ function permissionsFor(overwrites) {
       [ROLE_ID, { id: ROLE_ID, permissions: "0" }],
     ]),
   );
+}
+
+function thread(type, overrides = {}) {
+  return {
+    id: THREAD_ID,
+    guild_id: GUILD_ID,
+    parent_id: CHANNEL_ID,
+    type,
+    ...overrides,
+  };
+}
+
+function message(id = "100000000000000007", overrides = {}) {
+  return {
+    id,
+    content: "message content",
+    timestamp: "2026-08-06T00:00:00.000Z",
+    author: { id: "100000000000000008", username: "username" },
+    attachments: [],
+    ...overrides,
+  };
 }
 
 test("a member role deny overrides an @everyone allow", () => {
@@ -139,7 +170,11 @@ test("Administrator satisfies every required permission set", () => {
 });
 
 test("read handler denies a channel without READ_MESSAGE_HISTORY before requesting messages", async () => {
-  const { calls, tools } = registeredTools(VIEW_CHANNEL);
+  const { calls, tools } = registeredTools(VIEW_CHANNEL, {
+    getHandler: async (url) => url === `/channels/${CHANNEL_ID}`
+      ? { data: { id: CHANNEL_ID, guild_id: GUILD_ID, type: 0 } }
+      : undefined,
+  });
 
   const result = await tools.get("discord_read_messages").handler({
     channel_id: CHANNEL_ID,
@@ -263,6 +298,7 @@ test("message GET retries once and returns an error after a second 429", async (
   assert.deepEqual(resultJson(first).messages, []);
   assert.equal(second.isError, true);
   assert.equal(calls.filter((call) => call.url === `/channels/${CHANNEL_ID}/messages`).length, 4);
+  assert.equal(calls.some((call) => call.url === `/channels/${CHANNEL_ID}`), false);
   assert.deepEqual(delays, [0, 0]);
 });
 
@@ -316,6 +352,152 @@ test("send does not retry a rate-limited POST", async () => {
   assert.deepEqual(delays, []);
 });
 
+test("read handler reads every thread type under an accessible parent and preserves pagination", async () => {
+  for (const type of [10, 11, 12]) {
+    const { calls, tools } = registeredTools(VIEW_CHANNEL | READ_MESSAGE_HISTORY, {
+      channels: [{ id: CHANNEL_ID, type: type === 10 ? 5 : 0 }],
+      getHandler: async (url) => {
+        if (url === `/channels/${THREAD_ID}`) return { data: thread(type, {
+          thread_metadata: { archived: true, locked: true },
+        }) };
+        if (url === `/channels/${THREAD_ID}/messages`) return { data: [message()] };
+      },
+    });
+
+    const result = await tools.get("discord_read_messages").handler({
+      channel_id: THREAD_ID,
+      limit: 7,
+      before: "100000000000000009",
+    });
+
+    assert.deepEqual(resultJson(result), {
+      channel_id: THREAD_ID,
+      messages: [{
+        id: "100000000000000007",
+        content: "message content",
+        timestamp: "2026-08-06T00:00:00.000Z",
+        author: {
+          id: "100000000000000008",
+          name: "username",
+          username: "username",
+          bot: false,
+        },
+        attachments: [],
+        thread_id: null,
+      }],
+    });
+    assert.deepEqual(calls.find(({ url }) => url === `/channels/${THREAD_ID}/messages`).config, {
+      params: { limit: 7, before: "100000000000000009" },
+    });
+  }
+});
+
+test("thread lookup retries a rate limit once", async () => {
+  let attempts = 0;
+  const delays = [];
+  const { calls, tools } = registeredTools(VIEW_CHANNEL | READ_MESSAGE_HISTORY, {
+    getHandler: async (url) => {
+      if (url === `/channels/${THREAD_ID}/messages`) return { data: [] };
+      if (url !== `/channels/${THREAD_ID}`) return undefined;
+      attempts += 1;
+      if (attempts === 1) throw rateLimitError({ retryAfter: 0.25 });
+      return { data: thread(11) };
+    },
+    delay: async (milliseconds) => { delays.push(milliseconds); },
+  });
+
+  const result = await tools.get("discord_read_messages").handler({ channel_id: THREAD_ID, limit: 20 });
+
+  assert.deepEqual(resultJson(result).messages, []);
+  assert.deepEqual(delays, [250]);
+  assert.equal(calls.filter(({ url }) => url === `/channels/${THREAD_ID}`).length, 2);
+});
+
+test("thread reads reject targets outside the configured guild or accessible parent before messages", async () => {
+  const cases = [
+    ["missing guild", thread(11, { guild_id: undefined })],
+    ["other guild", thread(11, { guild_id: "100000000000000099" })],
+    ["wrong channel type", thread(0)],
+    ["resolved ID mismatch", thread(11, { id: OTHER_CHANNEL_ID })],
+    ["missing parent", thread(11, { parent_id: undefined })],
+    ["null parent", thread(11, { parent_id: null })],
+    ["unknown parent", thread(11, { parent_id: OTHER_CHANNEL_ID })],
+  ];
+  for (const [, resolved] of cases) {
+    const { calls, tools } = registeredTools(VIEW_CHANNEL | READ_MESSAGE_HISTORY, {
+      getHandler: async (url) => url === `/channels/${THREAD_ID}` ? { data: resolved } : undefined,
+    });
+    const result = await tools.get("discord_read_messages").handler({ channel_id: THREAD_ID, limit: 20 });
+    assert.equal(result.isError, true);
+    assert.match(resultJson(result).error, /required permissions/);
+    assertNoMessagesRequest(calls);
+  }
+});
+
+test("thread reads reject inaccessible and Forum or Media parents before messages", async () => {
+  const cases = [
+    ["parent lacks view", 0n, [{ id: CHANNEL_ID, type: 0 }]],
+    ["parent lacks history", VIEW_CHANNEL, [{ id: CHANNEL_ID, type: 0 }]],
+    ["Forum parent", VIEW_CHANNEL | READ_MESSAGE_HISTORY, [{ id: CHANNEL_ID, type: 15 }]],
+    ["Media parent", VIEW_CHANNEL | READ_MESSAGE_HISTORY, [{ id: CHANNEL_ID, type: 16 }]],
+  ];
+  for (const [, permissions, channels] of cases) {
+    const { calls, tools } = registeredTools(permissions, {
+      channels,
+      getHandler: async (url) => url === `/channels/${THREAD_ID}` ? { data: thread(11) } : undefined,
+    });
+    const result = await tools.get("discord_read_messages").handler({ channel_id: THREAD_ID, limit: 20 });
+    assert.equal(result.isError, true);
+    assertNoMessagesRequest(calls);
+  }
+});
+
+test("thread access failures from Discord are reported without a message request", async () => {
+  const { calls, tools } = registeredTools(VIEW_CHANNEL | READ_MESSAGE_HISTORY, {
+    getHandler: async (url) => {
+      if (url === `/channels/${THREAD_ID}`) throw discordApiError(403, "Missing Access");
+    },
+  });
+
+  const result = await tools.get("discord_read_messages").handler({ channel_id: THREAD_ID, limit: 20 });
+
+  assert.equal(result.isError, true);
+  assert.equal(resultJson(result).error, "Discord API 403: Missing Access");
+  assertNoMessagesRequest(calls);
+});
+
+test("thread message access failures are reported without mutating Discord", async () => {
+  const { calls, tools } = registeredTools(VIEW_CHANNEL | READ_MESSAGE_HISTORY, {
+    getHandler: async (url) => {
+      if (url === `/channels/${THREAD_ID}`) return { data: thread(12) };
+      if (url === `/channels/${THREAD_ID}/messages`) throw discordApiError(404, "Unknown Channel");
+    },
+  });
+
+  const result = await tools.get("discord_read_messages").handler({ channel_id: THREAD_ID, limit: 20 });
+
+  assert.equal(result.isError, true);
+  assert.equal(resultJson(result).error, "Discord API 404: Unknown Channel");
+  assert.equal(calls.filter(({ method }) => method === "post").length, 0);
+});
+
+test("list and send keep thread channels outside their contracts", async () => {
+  const { calls, tools } = registeredTools(VIEW_CHANNEL | SEND_MESSAGES, {
+    channels: [{ id: CHANNEL_ID, type: 0 }, thread(11)],
+  });
+
+  const listed = await tools.get("discord_list_channels").handler({});
+  const sent = await tools.get("discord_send_message").handler({
+    channel_id: THREAD_ID,
+    message: "Hello, Discord!",
+  });
+
+  assert.deepEqual(resultJson(listed).channels.map(({ id }) => id), [CHANNEL_ID]);
+  assert.equal(sent.isError, true);
+  assert.match(resultJson(sent).error, /required permissions/);
+  assert.equal(calls.filter(({ method }) => method === "post").length, 0);
+});
+
 test("only Guild Text and Announcement channels are supported", () => {
   for (const type of [0, 5]) {
     assert.equal(isSupportedChannel({ type }), true);
@@ -326,7 +508,7 @@ test("only Guild Text and Announcement channels are supported", () => {
   }
 });
 
-test("message output omits thread identifiers", () => {
+test("message output includes an active thread identifier or null", () => {
   const output = messageOutput({
     id: "100000000000000005",
     content: "message content",
@@ -351,6 +533,7 @@ test("message output omits thread identifiers", () => {
       bot: false,
     },
     attachments: [{ id: "100000000000000007", filename: "file.txt", url: "https://cdn.discordapp.com/file.txt" }],
+    thread_id: "100000000000000008",
   });
-  assert.equal("thread_id" in output, false);
+  assert.equal(messageOutput(message()).thread_id, null);
 });
