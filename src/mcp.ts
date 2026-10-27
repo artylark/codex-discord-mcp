@@ -9,9 +9,11 @@ const ADMINISTRATOR = 0x8n;
 const VIEW_CHANNEL = 0x400n;
 const READ_MESSAGE_HISTORY = 0x10000n;
 const SEND_MESSAGES = 0x800n;
+const SEND_MESSAGES_IN_THREADS = 0x4000000000n;
 const LIST_CHANNELS_PERMISSIONS = VIEW_CHANNEL;
 const READ_MESSAGES_PERMISSIONS = VIEW_CHANNEL | READ_MESSAGE_HISTORY;
 const SEND_MESSAGE_PERMISSIONS = VIEW_CHANNEL | SEND_MESSAGES;
+const SEND_THREAD_MESSAGE_PERMISSIONS = VIEW_CHANNEL | SEND_MESSAGES_IN_THREADS;
 const SUPPORTED_CHANNEL_TYPES = new Set([0, 5]);
 const THREAD_CHANNEL_TYPES = new Set([10, 11, 12]);
 const MAX_TIMER_DELAY = 2_147_483_647;
@@ -64,6 +66,7 @@ type DiscordMessage = {
 
 type DiscordClient = Pick<AxiosInstance, "get" | "post">;
 type Sleep = (milliseconds: number) => Promise<void>;
+type ChannelPermissions = { channel: DiscordChannel; permissions: bigint };
 
 export function channelPermissions(
   guildId: string,
@@ -220,7 +223,7 @@ export function registerDiscordTools(
   guildId: string,
   { delay = sleep }: { delay?: Sleep } = {},
 ): void {
-  const accessibleChannels = async (requiredPermissions: bigint): Promise<Map<string, DiscordChannel>> => {
+  const channelPermissionsSnapshot = async (): Promise<Map<string, ChannelPermissions>> => {
     const [channelsResponse, rolesResponse, currentUserResponse] = await Promise.all([
       discordGet<DiscordChannel[]>(discord, `/guilds/${guildId}/channels`, undefined, delay),
       discordGet<DiscordRole[]>(discord, `/guilds/${guildId}/roles`, undefined, delay),
@@ -233,27 +236,19 @@ export function registerDiscordTools(
       delay,
     );
     const roles = new Map(rolesResponse.data.map((role) => [role.id, role]));
-    return new Map(
-      channelsResponse.data
-        .filter(isSupportedChannel)
-        .filter((channel) => hasRequiredPermissions(
-          channelPermissions(guildId, channel, memberResponse.data, roles),
-          requiredPermissions,
-        ))
-        .map((channel) => [channel.id, channel]),
-    );
+    return new Map(channelsResponse.data
+      .filter(isSupportedChannel)
+      .map((channel) => [channel.id, {
+        channel,
+        permissions: channelPermissions(guildId, channel, memberResponse.data, roles),
+      }]));
   };
 
-  const assertAccessibleChannel = async (
-    channelId: string,
-    requiredPermissions: bigint,
-  ): Promise<DiscordChannel> => {
-    const channels = await accessibleChannels(requiredPermissions);
-    const channel = channels.get(channelId);
-    if (!channel) {
-      throw new Error("This bot does not have the required permissions for this supported channel.");
-    }
-    return channel;
+  const accessibleChannels = async (requiredPermissions: bigint): Promise<Map<string, DiscordChannel>> => {
+    const channels = await channelPermissionsSnapshot();
+    return new Map([...channels.values()]
+      .filter(({ permissions }) => hasRequiredPermissions(permissions, requiredPermissions))
+      .map(({ channel }) => [channel.id, channel]));
   };
 
   const assertReadableChannel = async (channelId: string): Promise<DiscordChannel> => {
@@ -273,6 +268,36 @@ export function registerDiscordTools(
       || thread.guild_id !== guildId
       || !thread.parent_id
       || !channels.has(thread.parent_id)
+    ) {
+      throw new Error("This bot does not have the required permissions for this supported channel or thread.");
+    }
+    return thread;
+  };
+
+  const assertSendableChannel = async (channelId: string): Promise<DiscordChannel> => {
+    const channels = await channelPermissionsSnapshot();
+    const directChannel = channels.get(channelId);
+    if (directChannel) {
+      if (!hasRequiredPermissions(directChannel.permissions, SEND_MESSAGE_PERMISSIONS)) {
+        throw new Error("This bot does not have the required permissions for this supported channel or thread.");
+      }
+      return directChannel.channel;
+    }
+
+    const response = await discordGet<DiscordChannel>(
+      discord,
+      `/channels/${channelId}`,
+      undefined,
+      delay,
+    );
+    const thread = response.data;
+    const parent = thread.parent_id ? channels.get(thread.parent_id) : undefined;
+    if (
+      thread.id !== channelId
+      || !THREAD_CHANNEL_TYPES.has(thread.type)
+      || thread.guild_id !== guildId
+      || !parent
+      || !hasRequiredPermissions(parent.permissions, SEND_THREAD_MESSAGE_PERMISSIONS)
     ) {
       throw new Error("This bot does not have the required permissions for this supported channel or thread.");
     }
@@ -334,7 +359,7 @@ export function registerDiscordTools(
     "discord_send_message",
     {
       title: "Send a Discord message",
-      description: "Sends a message as the configured Discord bot to one Guild Text or Announcement channel where it has VIEW_CHANNEL and SEND_MESSAGES. Forum, Media, and thread channels are excluded. Mentions are never notified.",
+      description: "Sends a message as the configured Discord bot to one Guild Text or Announcement channel where it has VIEW_CHANNEL and SEND_MESSAGES, or to a supplied thread under one where it has VIEW_CHANNEL and SEND_MESSAGES_IN_THREADS. Discord enforces private-thread membership and locked-thread access; sending can unarchive an unlocked archived thread. Forum and Media channels remain excluded. Mentions are never notified.",
       inputSchema: {
         channel_id: z.string().regex(DISCORD_SNOWFLAKE, "Use a Discord channel ID."),
         message: z.string().trim().min(1).max(2_000),
@@ -343,7 +368,7 @@ export function registerDiscordTools(
     },
     async ({ channel_id, message }) => {
       try {
-        await assertAccessibleChannel(channel_id, SEND_MESSAGE_PERMISSIONS);
+        await assertSendableChannel(channel_id);
         const response = await discord.post<DiscordMessage>(`/channels/${channel_id}/messages`, {
           content: message,
           allowed_mentions: { parse: [] },
