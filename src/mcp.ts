@@ -13,10 +13,12 @@ const LIST_CHANNELS_PERMISSIONS = VIEW_CHANNEL;
 const READ_MESSAGES_PERMISSIONS = VIEW_CHANNEL | READ_MESSAGE_HISTORY;
 const SEND_MESSAGE_PERMISSIONS = VIEW_CHANNEL | SEND_MESSAGES;
 const SUPPORTED_CHANNEL_TYPES = new Set([0, 5]);
+const THREAD_CHANNEL_TYPES = new Set([10, 11, 12]);
 const MAX_TIMER_DELAY = 2_147_483_647;
 
 type DiscordChannel = {
   id: string;
+  guild_id?: string;
   name?: string;
   parent_id?: string | null;
   type: number;
@@ -121,6 +123,7 @@ export function messageOutput(message: DiscordMessage) {
       bot: message.author.bot ?? false,
     },
     attachments: message.attachments.map(({ id, filename, url }) => ({ id, filename, url })),
+    thread_id: message.thread?.id ?? null,
   };
 }
 
@@ -253,6 +256,29 @@ export function registerDiscordTools(
     return channel;
   };
 
+  const assertReadableChannel = async (channelId: string): Promise<DiscordChannel> => {
+    const channels = await accessibleChannels(READ_MESSAGES_PERMISSIONS);
+    if (channels.has(channelId)) return channels.get(channelId)!;
+
+    const response = await discordGet<DiscordChannel>(
+      discord,
+      `/channels/${channelId}`,
+      undefined,
+      delay,
+    );
+    const thread = response.data;
+    if (
+      thread.id !== channelId
+      || !THREAD_CHANNEL_TYPES.has(thread.type)
+      || thread.guild_id !== guildId
+      || !thread.parent_id
+      || !channels.has(thread.parent_id)
+    ) {
+      throw new Error("This bot does not have the required permissions for this supported channel or thread.");
+    }
+    return thread;
+  };
+
   server.registerTool(
     "discord_list_channels",
     {
@@ -279,7 +305,7 @@ export function registerDiscordTools(
     "discord_read_messages",
     {
       title: "Read Discord messages",
-      description: "Reads recent messages from one Guild Text or Announcement channel where the bot has VIEW_CHANNEL and READ_MESSAGE_HISTORY. Forum, Media, and thread channels are excluded.",
+      description: "Reads recent messages from one Guild Text or Announcement channel, or a supplied thread under one, where the bot has VIEW_CHANNEL and READ_MESSAGE_HISTORY. Forum and Media channels remain excluded.",
       inputSchema: {
         channel_id: z.string().regex(DISCORD_SNOWFLAKE, "Use a Discord channel ID."),
         limit: z.number().int().min(1).max(50).default(20),
@@ -289,7 +315,7 @@ export function registerDiscordTools(
     },
     async ({ channel_id, limit, before }) => {
       try {
-        await assertAccessibleChannel(channel_id, READ_MESSAGES_PERMISSIONS);
+        await assertReadableChannel(channel_id);
         const response = await discordGet<DiscordMessage[]>(
           discord,
           `/channels/${channel_id}/messages`,
