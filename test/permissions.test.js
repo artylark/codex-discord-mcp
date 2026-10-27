@@ -16,6 +16,7 @@ const ADMINISTRATOR = 0x8n;
 const VIEW_CHANNEL = 0x400n;
 const READ_MESSAGE_HISTORY = 0x10000n;
 const SEND_MESSAGES = 0x800n;
+const SEND_MESSAGES_IN_THREADS = 0x4000000000n;
 const CHANNEL_ID = "100000000000000004";
 const THREAD_ID = "100000000000000005";
 const OTHER_CHANNEL_ID = "100000000000000006";
@@ -167,6 +168,7 @@ test("required permissions must all be present", () => {
 
 test("Administrator satisfies every required permission set", () => {
   assert.equal(hasRequiredPermissions(ADMINISTRATOR, VIEW_CHANNEL | SEND_MESSAGES), true);
+  assert.equal(hasRequiredPermissions(ADMINISTRATOR, VIEW_CHANNEL | SEND_MESSAGES_IN_THREADS), true);
 });
 
 test("read handler denies a channel without READ_MESSAGE_HISTORY before requesting messages", async () => {
@@ -187,16 +189,18 @@ test("read handler denies a channel without READ_MESSAGE_HISTORY before requesti
 });
 
 test("send handler denies a channel without SEND_MESSAGES before posting a message", async () => {
-  const { calls, tools } = registeredTools(VIEW_CHANNEL);
+  for (const permissions of [VIEW_CHANNEL, SEND_MESSAGES, VIEW_CHANNEL | SEND_MESSAGES_IN_THREADS]) {
+    const { calls, tools } = registeredTools(permissions);
 
-  const result = await tools.get("discord_send_message").handler({
-    channel_id: CHANNEL_ID,
-    message: "Hello, Discord!",
-  });
+    const result = await tools.get("discord_send_message").handler({
+      channel_id: CHANNEL_ID,
+      message: "Hello, Discord!",
+    });
 
-  assert.match(resultJson(result).error, /required permissions/);
-  assert.equal(result.isError, true);
-  assertNoMessagesRequest(calls);
+    assert.match(resultJson(result).error, /required permissions/);
+    assert.equal(result.isError, true);
+    assertNoMessagesRequest(calls);
+  }
 });
 
 test("list handler marks Discord failures as errors", async () => {
@@ -352,6 +356,237 @@ test("send does not retry a rate-limited POST", async () => {
   assert.deepEqual(delays, []);
 });
 
+test("send handler sends to Guild Text and Announcement channels with SEND_MESSAGES", async () => {
+  for (const type of [0, 5]) {
+    const { calls, tools } = registeredTools(VIEW_CHANNEL | SEND_MESSAGES, {
+      channels: [{ id: CHANNEL_ID, type }],
+      postHandler: async () => ({ data: message() }),
+    });
+
+    const result = await tools.get("discord_send_message").handler({
+      channel_id: CHANNEL_ID,
+      message: "Hello, Discord!",
+    });
+
+    assert.deepEqual(resultJson(result), {
+      channel_id: CHANNEL_ID,
+      message_id: "100000000000000007",
+      timestamp: "2026-08-06T00:00:00.000Z",
+      author: "username",
+    });
+    assert.deepEqual(calls.find(({ method }) => method === "post").data, {
+      content: "Hello, Discord!",
+      allowed_mentions: { parse: [] },
+    });
+    assert.equal(calls.find(({ method }) => method === "post").url, `/channels/${CHANNEL_ID}/messages`);
+  }
+});
+
+test("send handler sends to every thread type with SEND_MESSAGES_IN_THREADS", async () => {
+  for (const type of [10, 11, 12]) {
+    const { calls, tools } = registeredTools(VIEW_CHANNEL | SEND_MESSAGES_IN_THREADS, {
+      channels: [{ id: CHANNEL_ID, type: type === 10 ? 5 : 0 }],
+      getHandler: async (url) => url === `/channels/${THREAD_ID}` ? {
+        data: thread(type, { thread_metadata: { archived: true, locked: false } }),
+      } : undefined,
+      postHandler: async () => ({ data: message() }),
+    });
+
+    const result = await tools.get("discord_send_message").handler({
+      channel_id: THREAD_ID,
+      message: "Hello, thread!",
+    });
+
+    assert.deepEqual(resultJson(result), {
+      channel_id: THREAD_ID,
+      message_id: "100000000000000007",
+      timestamp: "2026-08-06T00:00:00.000Z",
+      author: "username",
+    });
+    const posts = calls.filter(({ method }) => method === "post");
+    assert.equal(posts.length, 1);
+    assert.equal(posts[0].url, `/channels/${THREAD_ID}/messages`);
+    assert.deepEqual(posts[0].data, {
+      content: "Hello, thread!",
+      allowed_mentions: { parse: [] },
+    });
+    assert.equal(calls.some(({ url }) => url === `/channels/${THREAD_ID}`), true);
+  }
+});
+
+test("thread sends require VIEW_CHANNEL and SEND_MESSAGES_IN_THREADS, not SEND_MESSAGES", async () => {
+  for (const permissions of [
+    SEND_MESSAGES_IN_THREADS,
+    VIEW_CHANNEL,
+    VIEW_CHANNEL | SEND_MESSAGES,
+  ]) {
+    const { calls, tools } = registeredTools(permissions, {
+      getHandler: async (url) => url === `/channels/${THREAD_ID}` ? { data: thread(11) } : undefined,
+    });
+
+    const result = await tools.get("discord_send_message").handler({
+      channel_id: THREAD_ID,
+      message: "Hello, thread!",
+    });
+
+    assert.equal(result.isError, true);
+    assert.match(resultJson(result).error, /required permissions/);
+    assertNoMessagesRequest(calls);
+  }
+});
+
+test("thread sends honor parent overwrites and Administrator", async () => {
+  const cases = [
+    [
+      "deny",
+      VIEW_CHANNEL | SEND_MESSAGES_IN_THREADS,
+      [{ id: ROLE_ID, type: 0, allow: "0", deny: SEND_MESSAGES_IN_THREADS.toString() }],
+      true,
+    ],
+    ["Administrator", ADMINISTRATOR, [{ id: ROLE_ID, type: 0, allow: "0", deny: VIEW_CHANNEL.toString() }], false],
+  ];
+  for (const [, permissions, permission_overwrites, denied] of cases) {
+    const { calls, tools } = registeredTools(permissions, {
+      channels: [{ id: CHANNEL_ID, type: 0, permission_overwrites }],
+      getHandler: async (url) => url === `/channels/${THREAD_ID}` ? { data: thread(11) } : undefined,
+      postHandler: async () => ({ data: message() }),
+    });
+
+    const result = await tools.get("discord_send_message").handler({
+      channel_id: THREAD_ID,
+      message: "Hello, thread!",
+    });
+
+    assert.equal(result.isError === true, denied);
+    assert.equal(calls.filter(({ method }) => method === "post").length, denied ? 0 : 1);
+  }
+});
+
+test("thread sends reject invalid targets and unsupported parents before posting", async () => {
+  const cases = [
+    thread(0),
+    thread(11, { id: OTHER_CHANNEL_ID }),
+    thread(11, { guild_id: "100000000000000099" }),
+    thread(11, { guild_id: undefined }),
+    thread(11, { parent_id: undefined }),
+    thread(11, { parent_id: null }),
+    thread(11, { parent_id: OTHER_CHANNEL_ID }),
+  ];
+  for (const resolved of cases) {
+    const { calls, tools } = registeredTools(VIEW_CHANNEL | SEND_MESSAGES_IN_THREADS, {
+      getHandler: async (url) => url === `/channels/${THREAD_ID}` ? { data: resolved } : undefined,
+    });
+
+    const result = await tools.get("discord_send_message").handler({
+      channel_id: THREAD_ID,
+      message: "Hello, thread!",
+    });
+
+    assert.equal(result.isError, true);
+    assert.match(resultJson(result).error, /required permissions/);
+    assertNoMessagesRequest(calls);
+  }
+});
+
+test("thread sends reject Forum and Media parents before posting", async () => {
+  for (const type of [15, 16]) {
+    const { calls, tools } = registeredTools(VIEW_CHANNEL | SEND_MESSAGES_IN_THREADS, {
+      channels: [{ id: CHANNEL_ID, type }],
+      getHandler: async (url) => url === `/channels/${THREAD_ID}` ? { data: thread(11) } : undefined,
+    });
+
+    const result = await tools.get("discord_send_message").handler({
+      channel_id: THREAD_ID,
+      message: "Hello, thread!",
+    });
+
+    assert.equal(result.isError, true);
+    assertNoMessagesRequest(calls);
+  }
+});
+
+test("thread send lookup retries once and reports Discord failures without posting", async () => {
+  let attempts = 0;
+  const delays = [];
+  const { calls, tools } = registeredTools(VIEW_CHANNEL | SEND_MESSAGES_IN_THREADS, {
+    getHandler: async (url) => {
+      if (url !== `/channels/${THREAD_ID}`) return undefined;
+      attempts += 1;
+      if (attempts === 1) throw rateLimitError({ retryAfter: 0.25 });
+      if (attempts === 2) return { data: thread(11) };
+      throw discordApiError(403, "Missing Access");
+    },
+    postHandler: async () => ({ data: message() }),
+    delay: async (milliseconds) => { delays.push(milliseconds); },
+  });
+
+  const first = await tools.get("discord_send_message").handler({ channel_id: THREAD_ID, message: "Hello" });
+  const second = await tools.get("discord_send_message").handler({ channel_id: THREAD_ID, message: "Hello" });
+
+  assert.equal(first.isError, undefined);
+  assert.equal(second.isError, true);
+  assert.equal(resultJson(second).error, "Discord API 403: Missing Access");
+  assert.deepEqual(delays, [250]);
+  assert.equal(calls.filter(({ method }) => method === "post").length, 1);
+});
+
+test("thread send reports Discord POST failures without retrying", async () => {
+  const cases = [
+    [discordApiError(403, "Missing Access"), "Discord API 403: Missing Access"],
+    [discordApiError(404, "Unknown Channel"), "Discord API 404: Unknown Channel"],
+    [rateLimitError({ retryAfter: 0.25 }), "Discord API 429: You are being rate limited."],
+  ];
+  for (const [failure, expectedError] of cases) {
+    const delays = [];
+    const { calls, tools } = registeredTools(VIEW_CHANNEL | SEND_MESSAGES_IN_THREADS, {
+      getHandler: async (url) => url === `/channels/${THREAD_ID}` ? { data: thread(11) } : undefined,
+      postHandler: async () => { throw failure; },
+      delay: async (milliseconds) => { delays.push(milliseconds); },
+    });
+
+    const result = await tools.get("discord_send_message").handler({
+      channel_id: THREAD_ID,
+      message: "Hello, thread!",
+    });
+
+    assert.equal(result.isError, true);
+    assert.equal(resultJson(result).error, expectedError);
+    assert.equal(calls.filter(({ method }) => method === "post").length, 1);
+    assert.deepEqual(delays, []);
+  }
+});
+
+test("send permissions are refreshed for each call", async () => {
+  let currentPermissions = VIEW_CHANNEL | SEND_MESSAGES;
+  const { calls, tools } = registeredTools(() => currentPermissions, {
+    postHandler: async () => ({ data: message() }),
+  });
+
+  const first = await tools.get("discord_send_message").handler({ channel_id: CHANNEL_ID, message: "Hello" });
+  currentPermissions = 0n;
+  const second = await tools.get("discord_send_message").handler({ channel_id: CHANNEL_ID, message: "Hello" });
+
+  assert.equal(first.isError, undefined);
+  assert.equal(second.isError, true);
+  assert.equal(calls.filter(({ method }) => method === "post").length, 1);
+});
+
+test("thread send permissions are refreshed for each call", async () => {
+  let currentPermissions = VIEW_CHANNEL | SEND_MESSAGES_IN_THREADS;
+  const { calls, tools } = registeredTools(() => currentPermissions, {
+    getHandler: async (url) => url === `/channels/${THREAD_ID}` ? { data: thread(11) } : undefined,
+    postHandler: async () => ({ data: message() }),
+  });
+
+  const first = await tools.get("discord_send_message").handler({ channel_id: THREAD_ID, message: "Hello" });
+  currentPermissions = VIEW_CHANNEL;
+  const second = await tools.get("discord_send_message").handler({ channel_id: THREAD_ID, message: "Hello" });
+
+  assert.equal(first.isError, undefined);
+  assert.equal(second.isError, true);
+  assert.equal(calls.filter(({ method }) => method === "post").length, 1);
+});
+
 test("read handler reads every thread type under an accessible parent and preserves pagination", async () => {
   for (const type of [10, 11, 12]) {
     const { calls, tools } = registeredTools(VIEW_CHANNEL | READ_MESSAGE_HISTORY, {
@@ -481,21 +716,14 @@ test("thread message access failures are reported without mutating Discord", asy
   assert.equal(calls.filter(({ method }) => method === "post").length, 0);
 });
 
-test("list and send keep thread channels outside their contracts", async () => {
-  const { calls, tools } = registeredTools(VIEW_CHANNEL | SEND_MESSAGES, {
+test("list keeps thread channels outside its contract", async () => {
+  const { tools } = registeredTools(VIEW_CHANNEL | SEND_MESSAGES, {
     channels: [{ id: CHANNEL_ID, type: 0 }, thread(11)],
   });
 
   const listed = await tools.get("discord_list_channels").handler({});
-  const sent = await tools.get("discord_send_message").handler({
-    channel_id: THREAD_ID,
-    message: "Hello, Discord!",
-  });
 
   assert.deepEqual(resultJson(listed).channels.map(({ id }) => id), [CHANNEL_ID]);
-  assert.equal(sent.isError, true);
-  assert.match(resultJson(sent).error, /required permissions/);
-  assert.equal(calls.filter(({ method }) => method === "post").length, 0);
 });
 
 test("only Guild Text and Announcement channels are supported", () => {
