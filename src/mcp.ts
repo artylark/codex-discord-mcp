@@ -274,11 +274,16 @@ export function registerDiscordTools(
     return thread;
   };
 
-  const assertSendableChannel = async (channelId: string): Promise<DiscordChannel> => {
+  const assertSendableChannel = async (
+    channelId: string,
+    isReply: boolean,
+  ): Promise<DiscordChannel> => {
+    const directPermissions = SEND_MESSAGE_PERMISSIONS | (isReply ? READ_MESSAGE_HISTORY : 0n);
+    const threadPermissions = SEND_THREAD_MESSAGE_PERMISSIONS | (isReply ? READ_MESSAGE_HISTORY : 0n);
     const channels = await channelPermissionsSnapshot();
     const directChannel = channels.get(channelId);
     if (directChannel) {
-      if (!hasRequiredPermissions(directChannel.permissions, SEND_MESSAGE_PERMISSIONS)) {
+      if (!hasRequiredPermissions(directChannel.permissions, directPermissions)) {
         throw new Error("This bot does not have the required permissions for this supported channel or thread.");
       }
       return directChannel.channel;
@@ -297,7 +302,7 @@ export function registerDiscordTools(
       || !THREAD_CHANNEL_TYPES.has(thread.type)
       || thread.guild_id !== guildId
       || !parent
-      || !hasRequiredPermissions(parent.permissions, SEND_THREAD_MESSAGE_PERMISSIONS)
+      || !hasRequiredPermissions(parent.permissions, threadPermissions)
     ) {
       throw new Error("This bot does not have the required permissions for this supported channel or thread.");
     }
@@ -359,19 +364,28 @@ export function registerDiscordTools(
     "discord_send_message",
     {
       title: "Send a Discord message",
-      description: "Sends a message as the configured Discord bot to one Guild Text or Announcement channel where it has VIEW_CHANNEL and SEND_MESSAGES, or to a supplied thread under one where it has VIEW_CHANNEL and SEND_MESSAGES_IN_THREADS. Discord enforces private-thread membership and locked-thread access; sending can unarchive an unlocked archived thread. Forum and Media channels remain excluded. Mentions are never notified.",
+      description: "Sends a message as the configured Discord bot to one Guild Text or Announcement channel where it has VIEW_CHANNEL and SEND_MESSAGES, or to a supplied thread under one where it has VIEW_CHANNEL and SEND_MESSAGES_IN_THREADS. Optionally replies to a message in that same channel or thread; replies also require READ_MESSAGE_HISTORY and fail if the referenced message does not exist. Discord enforces private-thread membership and locked-thread access; sending can unarchive an unlocked archived thread. Forum and Media channels remain excluded. Mentions are never notified, including the replied-to author.",
       inputSchema: {
         channel_id: z.string().regex(DISCORD_SNOWFLAKE, "Use a Discord channel ID."),
         message: z.string().trim().min(1).max(2_000),
+        reply_to_message_id: z.string().regex(DISCORD_SNOWFLAKE, "Use a Discord message ID.").optional()
+          .describe("Message ID in channel_id to reply to."),
       },
       annotations: { destructiveHint: false, idempotentHint: false, openWorldHint: false },
     },
-    async ({ channel_id, message }) => {
+    async ({ channel_id, message, reply_to_message_id }) => {
       try {
-        await assertSendableChannel(channel_id);
+        await assertSendableChannel(channel_id, reply_to_message_id !== undefined);
         const response = await discord.post<DiscordMessage>(`/channels/${channel_id}/messages`, {
           content: message,
-          allowed_mentions: { parse: [] },
+          allowed_mentions: { parse: [], replied_user: false },
+          ...(reply_to_message_id !== undefined ? {
+            message_reference: {
+              message_id: reply_to_message_id,
+              channel_id,
+              fail_if_not_exists: true,
+            },
+          } : {}),
         });
         const sent = response.data;
         return textResult({
