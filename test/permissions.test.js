@@ -1,11 +1,16 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
+const { Client } = require("@modelcontextprotocol/sdk/client/index.js");
+const { InMemoryTransport } = require("@modelcontextprotocol/sdk/inMemory.js");
+const { McpServer } = require("@modelcontextprotocol/sdk/server/mcp.js");
 
 const {
   channelPermissions,
+  configuredGuildIds,
   hasRequiredPermissions,
   isSupportedChannel,
   messageOutput,
+  normalizeListArguments,
   registerDiscordTools,
 } = require("../lib/mcp.js");
 
@@ -21,6 +26,22 @@ const CHANNEL_ID = "100000000000000004";
 const THREAD_ID = "100000000000000005";
 const OTHER_CHANNEL_ID = "100000000000000006";
 const REPLY_TO_MESSAGE_ID = "100000000000000007";
+
+test("configured guild IDs prefer, validate, and deduplicate the plural setting", () => {
+  assert.deepEqual(configuredGuildIds({ DISCORD_GUILD_ID: GUILD_ID }), [GUILD_ID]);
+  assert.deepEqual(configuredGuildIds({
+    DISCORD_GUILD_ID: "invalid",
+    DISCORD_GUILD_IDS: ` ${GUILD_ID},200000000000000001,${GUILD_ID} `,
+  }), [GUILD_ID, "200000000000000001"]);
+  for (const guildIds of ["", `${GUILD_ID},`, `,${GUILD_ID}`, "invalid"]) {
+    assert.throws(
+      () => configuredGuildIds({ DISCORD_GUILD_ID: GUILD_ID, DISCORD_GUILD_IDS: guildIds }),
+      /DISCORD_GUILD_IDS/,
+    );
+  }
+  assert.throws(() => configuredGuildIds({}), /DISCORD_GUILD_ID is required/);
+  assert.throws(() => configuredGuildIds({ DISCORD_GUILD_ID: "invalid" }), /DISCORD_GUILD_ID/);
+});
 
 function registeredTools(permissions, {
   failChannelListing = false,
@@ -61,6 +82,12 @@ function registeredTools(permissions, {
       if (url === `/guilds/${GUILD_ID}/members/${MEMBER_ID}`) {
         return { data: { roles: [ROLE_ID], user: { id: MEMBER_ID } } };
       }
+      if (url === `/channels/${CHANNEL_ID}`) {
+        return { data: { ...(channels.find((channel) => channel.id === CHANNEL_ID) ?? {
+          id: CHANNEL_ID,
+          type: 0,
+        }), guild_id: GUILD_ID } };
+      }
       if (url === `/channels/${CHANNEL_ID}/messages`) {
         return { data: [] };
       }
@@ -78,12 +105,107 @@ function registeredTools(permissions, {
     },
   };
 
-  registerDiscordTools(server, discord, GUILD_ID, { delay });
+  registerDiscordTools(server, discord, [GUILD_ID], { delay });
   return { calls, tools };
 }
 
 function resultJson(result) {
   return JSON.parse(result.content[0].text);
+}
+
+const GUILD_B_ID = "200000000000000001";
+const GUILD_C_ID = "300000000000000001";
+const CHANNEL_B_ID = "200000000000000004";
+const THREAD_B_ID = "200000000000000005";
+const ROLE_B_ID = "200000000000000002";
+
+function multiGuildTools({ failGuildB = false, denyGuildB = false } = {}) {
+  const tools = new Map();
+  const calls = [];
+  const guilds = new Map([
+    [GUILD_ID, {
+      roleId: ROLE_ID,
+      channels: [{ id: CHANNEL_ID, type: 0, name: "a" }],
+    }],
+    [GUILD_B_ID, {
+      roleId: ROLE_B_ID,
+      channels: [{ id: CHANNEL_B_ID, type: 0, name: "b" }],
+    }],
+  ]);
+  const direct = new Map([
+    [CHANNEL_ID, { id: CHANNEL_ID, guild_id: GUILD_ID, type: 0 }],
+    [CHANNEL_B_ID, { id: CHANNEL_B_ID, guild_id: GUILD_B_ID, type: 0 }],
+    [THREAD_B_ID, { id: THREAD_B_ID, guild_id: GUILD_B_ID, parent_id: CHANNEL_B_ID, type: 11 }],
+    [OTHER_CHANNEL_ID, { id: OTHER_CHANNEL_ID, guild_id: GUILD_C_ID, type: 0 }],
+    ["300000000000000005", { id: "300000000000000005", guild_id: GUILD_C_ID, parent_id: OTHER_CHANNEL_ID, type: 11 }],
+  ]);
+  const discord = {
+    get: async (url, config) => {
+      calls.push({ method: "get", url, config });
+      if (url === "/users/@me") return { data: { id: MEMBER_ID } };
+      const match = url.match(/^\/guilds\/(\d+)\/(channels|roles)$/);
+      if (match) {
+        const guild = guilds.get(match[1]);
+        if (!guild) throw new Error(`Unexpected GET ${url}`);
+        if (match[1] === GUILD_B_ID && failGuildB && match[2] === "channels") throw new Error("Guild B unavailable");
+        return { data: match[2] === "channels" ? guild.channels : [
+          { id: match[1], permissions: "0" },
+          {
+            id: guild.roleId,
+            permissions: (
+              match[1] === GUILD_B_ID && denyGuildB
+                ? VIEW_CHANNEL | READ_MESSAGE_HISTORY
+                : VIEW_CHANNEL | READ_MESSAGE_HISTORY | SEND_MESSAGES | SEND_MESSAGES_IN_THREADS
+            ).toString(),
+          },
+        ] };
+      }
+      const memberMatch = url.match(/^\/guilds\/(\d+)\/members\/(\d+)$/);
+      if (memberMatch) {
+        const guild = guilds.get(memberMatch[1]);
+        if (!guild) throw new Error(`Unexpected GET ${url}`);
+        return { data: { roles: [guild.roleId], user: { id: MEMBER_ID } } };
+      }
+      const channelMatch = url.match(/^\/channels\/(\d+)$/);
+      if (channelMatch) return { data: direct.get(channelMatch[1]) };
+      if ([CHANNEL_ID, CHANNEL_B_ID, THREAD_B_ID].some((channelId) => url === `/channels/${channelId}/messages`)) return { data: [] };
+      throw new Error(`Unexpected GET ${url}`);
+    },
+    post: async (url, data) => {
+      calls.push({ method: "post", url, data });
+      return { data: message() };
+    },
+  };
+  const server = { registerTool(name, config, handler) { tools.set(name, { config, handler }); } };
+  registerDiscordTools(server, discord, [GUILD_ID, GUILD_B_ID]);
+  return { calls, tools };
+}
+
+async function sdkListClient() {
+  const calls = [];
+  const discord = {
+    get: async (url) => {
+      calls.push(url);
+      if (url === "/users/@me") return { data: { id: MEMBER_ID } };
+      if (url === `/guilds/${GUILD_ID}/channels`) return { data: [{ id: CHANNEL_ID, type: 0 }] };
+      if (url === `/guilds/${GUILD_ID}/roles`) return { data: [
+        { id: GUILD_ID, permissions: "0" },
+        { id: ROLE_ID, permissions: VIEW_CHANNEL.toString() },
+      ] };
+      if (url === `/guilds/${GUILD_ID}/members/${MEMBER_ID}`) {
+        return { data: { roles: [ROLE_ID], user: { id: MEMBER_ID } } };
+      }
+      throw new Error(`Unexpected GET ${url}`);
+    },
+    post: async () => { throw new Error("Unexpected POST"); },
+  };
+  const server = new McpServer({ name: "test", version: "1.0.0" });
+  registerDiscordTools(server, discord, [GUILD_ID]);
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  const client = new Client({ name: "test-client", version: "1.0.0" });
+  await server.connect(normalizeListArguments(serverTransport));
+  await client.connect(clientTransport);
+  return { calls, client, server };
 }
 
 function assertNoMessagesRequest(calls) {
@@ -216,6 +338,175 @@ test("list handler marks Discord failures as errors", async () => {
   assert.equal(result.isError, true);
 });
 
+test("list aggregates configured guilds, filters one guild, and rejects an unconfigured guild", async () => {
+  const { calls, tools } = multiGuildTools();
+
+  assert.equal(tools.get("discord_list_channels").config.inputSchema.guild_id.safeParse("invalid").success, false);
+  assert.equal(tools.get("discord_list_channels").config.inputSchema.guild_id.safeParse(GUILD_ID).success, true);
+
+  const all = await tools.get("discord_list_channels").handler({});
+  assert.deepEqual(resultJson(all).channels.map(({ id, guild_id }) => ({ id, guild_id })), [
+    { id: CHANNEL_ID, guild_id: GUILD_ID },
+    { id: CHANNEL_B_ID, guild_id: GUILD_B_ID },
+  ]);
+  calls.length = 0;
+  const filtered = await tools.get("discord_list_channels").handler({ guild_id: GUILD_ID });
+  assert.deepEqual(resultJson(filtered).channels.map(({ id }) => id), [CHANNEL_ID]);
+  assert.equal(calls.some(({ url }) => url.includes(GUILD_B_ID)), false);
+  calls.length = 0;
+  const denied = await tools.get("discord_list_channels").handler({ guild_id: GUILD_C_ID });
+  assert.equal(denied.isError, true);
+  assert.match(resultJson(denied).error, /required permissions/);
+  assert.equal(calls.length, 0);
+});
+
+test("SDK accepts omitted list arguments and exposes the optional guild filter", async () => {
+  const { calls, client, server } = await sdkListClient();
+  try {
+    const listed = await client.listTools();
+    const listTool = listed.tools.find(({ name }) => name === "discord_list_channels");
+    const readTool = listed.tools.find(({ name }) => name === "discord_read_messages");
+    const sendTool = listed.tools.find(({ name }) => name === "discord_send_message");
+    assert.equal(listTool.inputSchema.properties.guild_id.type, "string");
+    assert.equal(readTool.inputSchema.properties.guild_id, undefined);
+    assert.equal(sendTool.inputSchema.properties.guild_id, undefined);
+
+    const omitted = await client.callTool({ name: "discord_list_channels" });
+    assert.equal(omitted.isError, undefined);
+    assert.deepEqual(JSON.parse(omitted.content[0].text).channels.map(({ id }) => id), [CHANNEL_ID]);
+    const empty = await client.callTool({ name: "discord_list_channels", arguments: {} });
+    assert.deepEqual(JSON.parse(empty.content[0].text).channels.map(({ id }) => id), [CHANNEL_ID]);
+    const filtered = await client.callTool({ name: "discord_list_channels", arguments: { guild_id: GUILD_ID } });
+    assert.deepEqual(JSON.parse(filtered.content[0].text).channels.map(({ id }) => id), [CHANNEL_ID]);
+    calls.length = 0;
+    const invalidFilter = await client.callTool({ name: "discord_list_channels", arguments: { guild_id: null } });
+    assert.equal(invalidFilter.isError, true);
+    assert.match(invalidFilter.content[0].text, /Input validation error/);
+    assert.deepEqual(calls, []);
+    for (const argumentsValue of [null, [], "invalid"]) {
+      calls.length = 0;
+      await assert.rejects(
+        () => client.callTool({ name: "discord_list_channels", arguments: argumentsValue }),
+        /expected record/,
+      );
+      assert.deepEqual(calls, []);
+    }
+  } finally {
+    await client.close();
+    await server.close();
+  }
+});
+
+test("read and send reject malformed target metadata before requesting messages or posting", async () => {
+  for (const channel of [
+    { id: "100000000000000099", guild_id: GUILD_ID, type: 0 },
+    { id: CHANNEL_ID, type: 0 },
+  ]) {
+    const { calls, tools } = registeredTools(VIEW_CHANNEL | READ_MESSAGE_HISTORY | SEND_MESSAGES, {
+      getHandler: async (url) => url === `/channels/${CHANNEL_ID}` ? { data: channel } : undefined,
+    });
+    const read = await tools.get("discord_read_messages").handler({ channel_id: CHANNEL_ID, limit: 20 });
+    assert.equal(read.isError, true);
+    assert.match(resultJson(read).error, /required permissions/);
+    assertNoMessagesRequest(calls);
+    const send = await tools.get("discord_send_message").handler({ channel_id: CHANNEL_ID, message: "Hello" });
+    assert.equal(send.isError, true);
+    assert.match(resultJson(send).error, /required permissions/);
+    assert.equal(calls.some(({ method }) => method === "post"), false);
+  }
+});
+
+test("read and send deny a supported direct target absent from its guild inventory", async () => {
+  const { calls, tools } = registeredTools(VIEW_CHANNEL | READ_MESSAGE_HISTORY | SEND_MESSAGES, {
+    channels: [],
+  });
+  const read = await tools.get("discord_read_messages").handler({ channel_id: CHANNEL_ID, limit: 20 });
+  const send = await tools.get("discord_send_message").handler({ channel_id: CHANNEL_ID, message: "Hello" });
+  assert.equal(read.isError, true);
+  assert.equal(send.isError, true);
+  assertNoMessagesRequest(calls);
+  assert.equal(calls.some(({ method }) => method === "post"), false);
+});
+
+test("a configured guild failure makes an aggregate list fail without a partial result", async () => {
+  const { tools } = multiGuildTools({ failGuildB: true });
+  const result = await tools.get("discord_list_channels").handler({});
+
+  assert.equal(result.isError, true);
+  assert.match(resultJson(result).error, /Guild B unavailable/);
+});
+
+test("Guild B direct and thread reads and sends use only Guild B permissions", async () => {
+  const { calls, tools } = multiGuildTools();
+  for (const channelId of [CHANNEL_B_ID, THREAD_B_ID]) {
+    calls.length = 0;
+    const read = await tools.get("discord_read_messages").handler({ channel_id: channelId, limit: 20 });
+    assert.deepEqual(resultJson(read), { channel_id: channelId, guild_id: GUILD_B_ID, messages: [] });
+    assert.equal(calls.some(({ url }) => url.includes(`/guilds/${GUILD_ID}/`)), false);
+    calls.length = 0;
+    const sent = await tools.get("discord_send_message").handler({
+      channel_id: channelId,
+      message: "Hello",
+      reply_to_message_id: REPLY_TO_MESSAGE_ID,
+    });
+    assert.equal(resultJson(sent).guild_id, GUILD_B_ID);
+    assert.equal(calls.some(({ url }) => url.includes(`/guilds/${GUILD_ID}/`)), false);
+    const post = calls.find(({ method }) => method === "post");
+    assert.equal(post.url, `/channels/${channelId}/messages`);
+    assert.deepEqual(post.data, {
+      content: "Hello",
+      allowed_mentions: { parse: [], replied_user: false },
+      message_reference: {
+        message_id: REPLY_TO_MESSAGE_ID,
+        channel_id: channelId,
+        fail_if_not_exists: true,
+      },
+    });
+  }
+});
+
+test("unconfigured guild targets are rejected before a snapshot, message read, or post", async () => {
+  const { calls, tools } = multiGuildTools();
+  for (const channelId of [OTHER_CHANNEL_ID, "300000000000000005"]) {
+    for (const tool of ["discord_read_messages", "discord_send_message"]) {
+      calls.length = 0;
+      const result = tool === "discord_read_messages"
+        ? await tools.get(tool).handler({ channel_id: channelId, limit: 20 })
+        : await tools.get(tool).handler({ channel_id: channelId, message: "Hello" });
+      assert.equal(result.isError, true);
+      assert.equal(
+        resultJson(result).error,
+        "This bot does not have the required permissions for this supported channel or thread.",
+      );
+      assert.equal(calls.some(({ url }) => url.startsWith("/guilds/")), false);
+      assertNoMessagesRequest(calls);
+      assert.equal(calls.some(({ method }) => method === "post"), false);
+    }
+  }
+});
+
+test("Guild A operations do not depend on an unavailable configured Guild B", async () => {
+  const { calls, tools } = multiGuildTools({ failGuildB: true });
+  const list = await tools.get("discord_list_channels").handler({ guild_id: GUILD_ID });
+  assert.deepEqual(resultJson(list).channels.map(({ id }) => id), [CHANNEL_ID]);
+  const read = await tools.get("discord_read_messages").handler({ channel_id: CHANNEL_ID, limit: 20 });
+  assert.equal(read.isError, undefined);
+  const sent = await tools.get("discord_send_message").handler({ channel_id: CHANNEL_ID, message: "Hello" });
+  assert.equal(sent.isError, undefined);
+  assert.equal(calls.some(({ url }) => url.includes(`/guilds/${GUILD_B_ID}/`)), false);
+});
+
+test("guild-specific permission snapshots do not use another guild's role permissions", async () => {
+  const { calls, tools } = multiGuildTools({ denyGuildB: true });
+  const denied = await tools.get("discord_send_message").handler({ channel_id: CHANNEL_B_ID, message: "Hello" });
+  assert.equal(denied.isError, true);
+  assert.match(resultJson(denied).error, /required permissions/);
+  const allowed = await tools.get("discord_send_message").handler({ channel_id: CHANNEL_ID, message: "Hello" });
+  assert.equal(allowed.isError, undefined);
+  assert.equal(calls.some(({ url }) => url === `/guilds/${GUILD_B_ID}/roles`), true);
+  assert.equal(calls.some(({ url }) => url === `/guilds/${GUILD_ID}/roles`), true);
+});
+
 test("preflight GET requests retry once after Discord's retry_after delay", async () => {
   const attempts = new Set();
   const delays = [];
@@ -306,7 +597,7 @@ test("message GET retries once and returns an error after a second 429", async (
   assert.deepEqual(resultJson(first).messages, []);
   assert.equal(second.isError, true);
   assert.equal(calls.filter((call) => call.url === `/channels/${CHANNEL_ID}/messages`).length, 4);
-  assert.equal(calls.some((call) => call.url === `/channels/${CHANNEL_ID}`), false);
+  assert.equal(calls.filter((call) => call.url === `/channels/${CHANNEL_ID}`).length, 2);
   assert.deepEqual(delays, [0, 0]);
 });
 
@@ -326,7 +617,7 @@ test("concurrent calls authorize against separate preflight snapshots", async ()
 
   assert.deepEqual(resultJson(listResult).channels.map(({ id }) => id), [CHANNEL_ID]);
   assert.equal(sendResult.isError, true);
-  assert.equal(calls.filter((call) => call.method === "get").length, 8);
+  assert.equal(calls.filter((call) => call.method === "get").length, 9);
   assert.equal(calls.filter((call) => call.method === "post").length, 0);
 });
 
@@ -374,6 +665,7 @@ test("send handler sends to Guild Text and Announcement channels with SEND_MESSA
 
     assert.deepEqual(resultJson(result), {
       channel_id: CHANNEL_ID,
+      guild_id: GUILD_ID,
       message_id: "100000000000000007",
       timestamp: "2026-08-06T00:00:00.000Z",
       author: "username",
@@ -403,6 +695,7 @@ test("send handler sends to every thread type with SEND_MESSAGES_IN_THREADS", as
 
     assert.deepEqual(resultJson(result), {
       channel_id: THREAD_ID,
+      guild_id: GUILD_ID,
       message_id: "100000000000000007",
       timestamp: "2026-08-06T00:00:00.000Z",
       author: "username",
@@ -762,6 +1055,7 @@ test("read handler reads every thread type under an accessible parent and preser
 
     assert.deepEqual(resultJson(result), {
       channel_id: THREAD_ID,
+      guild_id: GUILD_ID,
       messages: [{
         id: "100000000000000007",
         content: "message content",
